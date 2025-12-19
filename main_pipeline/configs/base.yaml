@@ -1,0 +1,54 @@
+# Base configuration file - contains all default settings
+
+# Experiment name - used for organizing output directories
+exp_name: ptm-mamba
+
+# Random seed
+seed: 42
+
+# Reporting/logging backend
+report_to: []
+
+# Dataset configuration
+dataset:
+  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/mamba.csv"
+  sequence_column_name: "ptm_seq"
+  val_size: 10000
+  test_size: 5000
+  split: true
+  subsample_size: null
+  split_seed: 42
+  max_sequence_length: null
+
+# Training arguments
+training:
+  resume_from_checkpoint: null
+  use_esm: true
+  # Use pre-computed embeddings (set to true and provide embeddings_dir to use pre-generated embeddings)
+  use_precomputed_embeddings: false
+  embeddings_dir: null  # Path to directory containing train_embeddings.json, val_embeddings.json, test_embeddings.json
+  num_train_epochs: 10
+  log_steps: 1000
+  sort_by_seq: true
+  sample_len_ascending: true
+  per_device_train_batch_size: 8
+  max_tokens_per_batch: 100000
+  max_sequence_length: 512
+  lr: 4e-4
+  # GPU configuration: exclude specific GPUs (e.g., [0, 2] to exclude GPU 0 and 2)
+  # Leave as null to use all available GPUs
+  exclude_gpus: [3]
+
+# Model configuration
+model:
+  model_type: "mamba"
+  d_model: 512
+  n_layer: 12
+  vocab_size: 50277  # Will be auto-set by tokenizer
+  rms_norm: true
+  residual_in_fp32: true
+  fused_add_norm: true
+  pad_vocab_size_multiple: 8
+  esm_embed_dim: 5120  # ESM2-15B (esm2_t48_15B_UR50D) embedding dimension
+  ssm_cfg: {}
+

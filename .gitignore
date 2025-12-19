@@ -205,3 +205,50 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+ori_datasets
+checkpoints
+outputs
+embeddings
+
+# Model checkpoints and trained models
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.h5
+*.hdf5
+trained_head.pt
+best.ckpt
+last.ckpt
+
+# Downstream task outputs
+downstream_tasks/**/embeddings/
+downstream_tasks/**/*_embeddings.pt
+downstream_tasks/**/*_labels.pt
+downstream_tasks/**/*_sequences.pt
+downstream_tasks/**/*_predictions.txt
+downstream_tasks/**/*_predictions.csv
+downstream_tasks/**/trained_head.pt
+downstream_tasks/**/best.ckpt
+downstream_tasks/**/last.ckpt
+
+# Data files (CSV files are too large for git)
+*.csv
+*.csv.bak
+*.txt.bak
+*_processed.*
+*_generated.*
+*.txt
+
+# Logs and metrics
+*.log
+metrics.json
+wandb/
+tensorboard/
+runs/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
