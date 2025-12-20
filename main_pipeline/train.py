@@ -77,12 +77,17 @@ def train(
     embeddings_dir = train_args.get("embeddings_dir", None)
     embedding_loader = None
     
+    # Get seed from config for reproducible window selection
+    seed = config_dict.get("seed", None)
+    
     if train_args.get("use_esm", False):
         if use_precomputed_embeddings and embeddings_dir:
             # Load pre-computed embeddings
             if accelerator.is_local_main_process:
                 print(f"📦 Loading pre-computed embeddings from {embeddings_dir}")
-            embedding_loader = EmbeddingLoader(embeddings_dir)
+                if seed is not None:
+                    print(f"🔑 Using seed {seed} for reproducible window selection")
+            embedding_loader = EmbeddingLoader(embeddings_dir, seed=seed)
             esm_model = None
             batch_converter = None
         else:
@@ -125,8 +130,8 @@ def train(
             # compute ESM embedding
             if train_args.get("use_esm", False):
                 if embedding_loader is not None and unique_ids is not None:
-                    # Use pre-computed embeddings
-                    embedding = embedding_loader.get_embeddings(unique_ids, device)
+                    # Use pre-computed embeddings (random window selection for training)
+                    embedding = embedding_loader.get_embeddings(unique_ids, device, is_training=True)
                     if embedding is None:
                         # Fallback to on-the-fly computation if embeddings not found
                         esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
@@ -166,13 +171,17 @@ def train(
             # compute accuracy
             preplexity = torch.exp(loss)
             acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-            ptm_acc = (
-                (logits.argmax(dim=-1) == input_ids)[
-                    pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-                ]
-                .float()
-                .mean()
-            )
+            # Compute PTM accuracy - handle case when no PTM tokens are masked
+            ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
+            if ptm_mask.any():
+                ptm_acc = (
+                    (logits.argmax(dim=-1) == input_ids)[ptm_mask]
+                    .float()
+                    .mean()
+                )
+            else:
+                # No PTM tokens masked in this batch, set accuracy to 0.0
+                ptm_acc = torch.tensor(0.0, device=device)
             
             # update parameters
             optimizer.step()
@@ -225,7 +234,8 @@ def train(
                         
                         if train_args.get("use_esm", False):
                             if embedding_loader is not None and unique_ids is not None:
-                                embedding = embedding_loader.get_embeddings(unique_ids, device)
+                                # Use pre-computed embeddings (fixed window selection for validation)
+                                embedding = embedding_loader.get_embeddings(unique_ids, device, is_training=False)
                                 if embedding is None:
                                     esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
                                     masked_esm_input_ids = esm_input_ids.clone()
@@ -254,13 +264,17 @@ def train(
                     # compute accuracy
                     preplexity = torch.exp(loss)
                     acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-                    ptm_acc = (
-                        (logits.argmax(dim=-1) == input_ids)[
-                            pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-                        ]
-                        .float()
-                        .mean()
-                    )
+                    # Compute PTM accuracy - handle case when no PTM tokens are masked
+                    ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
+                    if ptm_mask.any():
+                        ptm_acc = (
+                            (logits.argmax(dim=-1) == input_ids)[ptm_mask]
+                            .float()
+                            .mean()
+                        )
+                    else:
+                        # No PTM tokens masked in this batch, set accuracy to 0.0
+                        ptm_acc = torch.tensor(0.0, device=device)
                     
                     # Accumulate metrics for averaging
                     val_losses.append(loss.item())
@@ -356,7 +370,8 @@ def train(
                     
                     if train_args.get("use_esm", False):
                         if embedding_loader is not None and unique_ids is not None:
-                            embedding = embedding_loader.get_embeddings(unique_ids, device)
+                            # Use pre-computed embeddings (fixed window selection for test)
+                            embedding = embedding_loader.get_embeddings(unique_ids, device, is_training=False)
                             if embedding is None:
                                 esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
                                 masked_esm_input_ids = esm_input_ids.clone()
@@ -386,13 +401,17 @@ def train(
                 # compute accuracy
                 preplexity = torch.exp(loss)
                 acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-                ptm_acc = (
-                    (logits.argmax(dim=-1) == input_ids)[
-                        pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-                    ]
-                    .float()
-                    .mean()
-                )
+                # Compute PTM accuracy - handle case when no PTM tokens are masked
+                ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
+                if ptm_mask.any():
+                    ptm_acc = (
+                        (logits.argmax(dim=-1) == input_ids)[ptm_mask]
+                        .float()
+                        .mean()
+                    )
+                else:
+                    # No PTM tokens masked in this batch, set accuracy to 0.0
+                    ptm_acc = torch.tensor(0.0, device=device)
                 
                 # Accumulate metrics
                 test_losses.append(loss.item())
@@ -504,6 +523,8 @@ def main():
         logger = TrainLogger(save_dir=logger_save_dir, config=cfg if accelerator.is_local_main_process else None)
 
     tokenizer = PTMTokenizer()
+    # Use main seed for split_seed if not explicitly provided (for reproducibility)
+    split_seed = data_config.get("split_seed", cfg.get("seed", 42))
     dataset = get_ptm_dataset(
         tokenizer=tokenizer,
         dataset_location=data_config["dataset_location"],
@@ -512,7 +533,7 @@ def main():
         test_size=data_config.get("test_size", 0),
         split=data_config.get("split", True),
         subsample_size=data_config.get("subsample_size", None),
-        split_seed=data_config.get("split_seed", None),
+        split_seed=split_seed,
         max_sequence_length=data_config.get("max_sequence_length", None),
     )
     

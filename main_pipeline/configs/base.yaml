@@ -41,7 +41,7 @@ training:
 
 # Model configuration
 model:
-  model_type: "mamba"
+  model_type: "bidirectional_mamba"
   d_model: 512
   n_layer: 12
   vocab_size: 50277  # Will be auto-set by tokenizer

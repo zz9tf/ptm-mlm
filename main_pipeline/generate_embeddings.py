@@ -21,6 +21,62 @@ from utils.config import load_config
 from utils.esm_utils import make_esm_input_ids
 
 
+def compute_extraction_windows(sequence_length, max_length):
+    """
+    Compute extraction windows for sequences of different lengths.
+    
+    Strategy:
+    - sequence < max_length: Extract once (full sequence)
+    - max_length <= sequence < 10 * max_length: Uniform extraction with overlap
+    - sequence >= 10 * max_length: Uniform extraction without overlap
+    
+    @param sequence_length: Length of the sequence
+    @param max_length: Maximum sequence length for each window
+    @return: List of (start_idx, end_idx) tuples for each window
+    """
+    if max_length is None or sequence_length <= max_length:
+        # Case 1: Sequence is shorter than max_length, extract once
+        return [(0, sequence_length)]
+    
+    if sequence_length < 10 * max_length:
+        # Case 2: Medium length sequence, uniform extraction with overlap
+        # Calculate number of windows to ensure good coverage
+        # Target: ~30% overlap between adjacent windows
+        num_windows = int(np.ceil(sequence_length / (max_length * 0.7)))
+        num_windows = max(2, num_windows)  # At least 2 windows
+        
+        # Calculate step size to ensure uniform distribution with overlap
+        # Formula: step_size = (sequence_length - max_length) / (num_windows - 1)
+        # This ensures first window starts at 0 and last window ends at sequence_length
+        if num_windows == 1:
+            step_size = 0
+        else:
+            step_size = (sequence_length - max_length) / (num_windows - 1)
+        
+        windows = []
+        for i in range(num_windows):
+            start_idx = int(i * step_size)
+            end_idx = min(start_idx + max_length, sequence_length)
+            if end_idx > start_idx:  # Ensure valid window
+                windows.append((start_idx, end_idx))
+        
+        # Ensure the last window covers the end of the sequence
+        if windows and windows[-1][1] < sequence_length:
+            windows[-1] = (max(0, sequence_length - max_length), sequence_length)
+        
+        return windows
+    else:
+        # Case 3: Long sequence, uniform extraction without overlap
+        num_windows = int(np.ceil(sequence_length / max_length))
+        windows = []
+        for i in range(num_windows):
+            start_idx = i * max_length
+            end_idx = min(start_idx + max_length, sequence_length)
+            if end_idx > start_idx:  # Ensure valid window
+                windows.append((start_idx, end_idx))
+        return windows
+
+
 def generate_embeddings_for_dataset(
     dataset,
     tokenizer,
@@ -105,51 +161,48 @@ def generate_embeddings_for_dataset(
             # Convert to tensors and prepare for ESM
             input_ids_list = [torch.tensor(ids, device=device) for ids in tokenized]
             
-            # Apply length limit (same as training) - crop sequences if needed
-            # Note: We use fixed cropping (from start) for consistency, while training uses random cropping
-            # This ensures embeddings are consistent across runs
-            if max_sequence_length is not None:
-                cropped_list = []
-                for ids in input_ids_list:
-                    if len(ids) > max_sequence_length:
-                        # Fixed crop from start (for consistency in embeddings)
-                        cropped_list.append(ids[:max_sequence_length])
+            # Process each sequence with window extraction strategy
+            # Store each window separately (not merged) for random selection during training
+            for idx, input_ids in enumerate(input_ids_list):
+                seq_len = len(input_ids)
+                unique_id = unique_ids[idx]
+                
+                # Compute extraction windows for this sequence
+                windows = compute_extraction_windows(seq_len, max_sequence_length)
+                
+                # Process each window separately
+                for win_idx, (window_start, window_end) in enumerate(windows):
+                    window_ids = input_ids[window_start:window_end]
+                    window_len = window_end - window_start
+                    
+                    # Prepare ESM input (ESM batch_converter will handle padding)
+                    window_ids = window_ids.unsqueeze(0)  # Add batch dimension
+                    esm_input_ids = make_esm_input_ids(window_ids, tokenizer)
+                    
+                    # Convert to sequence for ESM
+                    esm_input = (0, tokenizer.decode(esm_input_ids[0].detach().cpu().tolist()))
+                    
+                    # Compute ESM embedding
+                    with torch.no_grad():
+                        batch_labels, batch_strs, batch_tokens = batch_converter([esm_input])
+                        batch_tokens = batch_tokens[..., 1:-1].to(device)  # remove <cls> and <eos>
+                        out = esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
+                        window_emb = out["representations"][33][0]  # Shape: (seq_len, embed_dim)
+                    
+                    # Extract actual window embedding (remove padding if any)
+                    window_emb_actual = window_emb[:window_len].cpu().numpy()
+                    
+                    # Store each window separately with unique identifier
+                    if len(windows) == 1:
+                        # Single window: use original unique_id
+                        window_unique_id = unique_id
                     else:
-                        cropped_list.append(ids)
-                input_ids_list = cropped_list
-            
-            max_len = max(len(ids) for ids in input_ids_list)
-            
-            # Pad sequences
-            padded_input_ids = torch.zeros(len(input_ids_list), max_len, dtype=torch.long, device=device)
-            for idx, ids in enumerate(input_ids_list):
-                padded_input_ids[idx, :len(ids)] = ids
-            
-            # Prepare ESM input (replace PTM tokens with mask)
-            esm_input_ids = make_esm_input_ids(padded_input_ids, tokenizer)
-            
-            # Convert to sequences for ESM
-            esm_inputs = [
-                (j, tokenizer.decode(ids.detach().cpu().tolist()))
-                for j, ids in enumerate(esm_input_ids)
-            ]
-            
-            # Compute ESM embeddings
-            with torch.no_grad():
-                batch_labels, batch_strs, batch_tokens = batch_converter(esm_inputs)
-                batch_tokens = batch_tokens[..., 1:-1].to(device)  # remove <cls> and <eos>
-                out = esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
-                embeddings = out["representations"][33]  # Shape: (batch_size, seq_len, embed_dim)
-            
-            # Store embeddings for each sample (on this process)
-            for idx, unique_id in enumerate(unique_ids):
-                # Get the actual sequence length (without padding)
-                actual_len = len(input_ids_list[idx])
-                # Store embedding for the actual sequence (remove padding)
-                emb = embeddings[idx, :actual_len].cpu().numpy()
-                all_embeddings.append(emb)
-                all_unique_ids.append(unique_id)
-                all_lengths.append(actual_len)
+                        # Multiple windows: append window index to unique_id
+                        window_unique_id = f"{unique_id}_window_{win_idx}"
+                    
+                    all_embeddings.append(window_emb_actual)
+                    all_unique_ids.append(window_unique_id)
+                    all_lengths.append(window_len)
         
         # Gather all embeddings from all processes
         accelerator.wait_for_everyone()

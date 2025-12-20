@@ -302,12 +302,8 @@ class BiDirectionMixerModel(nn.Module):
         }
 
     def forward(self, input_ids, embedding=None, inference_params=None):
-        # Generate embedding from input_ids using our embedding layer (d_model dimension)
         hidden_states = self.embedding(input_ids) 
-        # If ESM embedding is provided, it should already be projected to d_model by esm_head
-        # If not provided, use zero embedding with same shape
         embedding = torch.zeros_like(hidden_states) if embedding is None else embedding
-        # Gate mechanism to fuse our embedding and ESM embedding (both are d_model dimension)
         gate = self.gate(torch.cat([hidden_states, embedding], dim=-1)).sigmoid()
         hidden_states = hidden_states * gate + embedding * (1 - gate)
         residual = None
@@ -417,7 +413,6 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
         if embedding is not None:
-            # Project ESM embedding from esm_embed_dim to d_model to match our embedding layer
             embedding = self.esm_head(embedding)
         hidden_states = self.backbone(
             input_ids, embedding=embedding, inference_params=inference_params
