@@ -14,7 +14,11 @@ import sys
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
-# Try to import both inference classes
+# Add inference directory to path for shared inference classes
+inference_dir = Path(__file__).parent.parent / "inference"
+sys.path.insert(0, str(inference_dir))
+
+# Try to import both inference classes from shared inference directory
 try:
     from inference import ModelInference
     MAMBA_AVAILABLE = True

@@ -1,6 +1,7 @@
 """
 ESM2 model inference script for generating embeddings.
 This script loads ESM2 model and generates embeddings for protein sequences.
+This is a shared module used by all downstream tasks.
 """
 import torch
 import sys
@@ -18,6 +19,7 @@ except ImportError:
 class ESM2Inference:
     """
     ESM2 model inference class for generating embeddings.
+    This class is shared across all downstream tasks.
     """
     
     def __init__(self, model_name: str = "facebook/esm2_t33_650M_UR50D", device: str = None, max_sequence_length: int = None):
