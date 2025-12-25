@@ -22,29 +22,26 @@ dataset:
 
 # Training arguments
 training:
-  resume_from_checkpoint: null
-  use_esm: true
+  resume_from_output: null  # Path to output directory to resume training from (e.g., "outputs/ptm-mamba-2025-12-22-15-01-34"). Always loads from last.ckpt
+  use_esm: false # or true
   # Use pre-computed embeddings (set to true and provide embeddings_dir to use pre-generated embeddings)
   use_precomputed_embeddings: false
-  embeddings_dir: null  # Path to directory containing train_embeddings.json, val_embeddings.json, test_embeddings.json
-  num_train_epochs: 10
+  embeddings_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/embeddings"  # Path to directory containing train_embeddings.json, val_embeddings.json, test_embeddings.json
+  num_train_epochs: 100
   log_steps: 1000
-  sort_by_seq: true
+  sort_by_seq: false
   sample_len_ascending: true
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 96 # or 8
   max_tokens_per_batch: 100000
   max_sequence_length: 512
   lr: 4e-4
-  # GPU configuration: exclude specific GPUs (e.g., [0, 2] to exclude GPU 0 and 2)
-  # Leave as null to use all available GPUs
-  exclude_gpus: [3]
 
 # Model configuration
 model:
   model_type: "bidirectional_mamba"
   d_model: 512
   n_layer: 12
-  vocab_size: 50277  # Will be auto-set by tokenizer
+  vocab_size: 50277  # Will be auto-set by tokenizer, 50277 for original Mamba
   rms_norm: true
   residual_in_fp32: true
   fused_add_norm: true

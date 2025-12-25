@@ -179,12 +179,18 @@ class ESM2Inference:
         @returns: List of embedding tensors, each with shape (window_len, hidden_size)
         """
         # Tokenize sequences
+        # 🔧 max_length should account for special tokens (<cls> and <eos>)
+        # ESM2 tokenizer adds 2 special tokens, so we need to add 2 to the max_sequence_length
+        # - Normal case: sequence length <= max_sequence_length (e.g., 512), tokenizer max_length = 512 + 2 = 514
+        # - Sliding window case: each window size is max_sequence_length (e.g., 512), tokenizer max_length = 512 + 2 = 514
+        # This ensures sequences/windows of max_sequence_length won't be truncated after adding special tokens
+        tokenizer_max_length = self.max_sequence_length + 2
         encoded = self.tokenizer(
             window_sequences,
             add_special_tokens=True,
             padding=True,
             truncation=True,
-            max_length=self.max_sequence_length,
+            max_length=tokenizer_max_length,
             return_tensors="pt"
         )
         

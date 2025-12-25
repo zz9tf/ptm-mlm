@@ -44,7 +44,7 @@ class ModelInference:
         
         # Load model from checkpoint
         print(f"📦 Loading Mamba model from {checkpoint_path}...")
-        self.model = load_ckpt(
+        self.model, _ = load_ckpt(
             checkpoint_path, 
             self.tokenizer, 
             self.device
@@ -233,13 +233,34 @@ class ModelInference:
         @param window_sequences: List of window sequence strings
         @returns: List of embedding tensors, each with shape (window_len, hidden_size)
         """
+        # Store original sequence lengths before tokenization
+        original_lengths = [len(seq) for seq in window_sequences]
+        
         # Tokenize window sequences
-        input_ids = self.tokenizer(
-            window_sequences,
-            add_special_tokens=True,
-            return_tensors=True,
-            max_sequence_length=None  # Windows are already within limit
-        ).to(self.device)
+        # 🔧 Fix: For sequences <= max_sequence_length, don't truncate
+        # Even if seq_len + 2 > max_sequence_length, we still process without truncation
+        # The model can handle it, and we extract embeddings by removing CLS and EOS
+        max_seq_len_in_batch = max(len(seq) for seq in window_sequences)
+        
+        if max_seq_len_in_batch <= self.max_sequence_length:
+            # All sequences fit: seq_len <= max_sequence_length
+            # Don't truncate, let tokenizer process full sequences (seq_len + 2 special tokens)
+            # Even if this exceeds max_sequence_length tokens, the model can handle it
+            input_ids = self.tokenizer(
+                window_sequences,
+                add_special_tokens=True,
+                return_tensors=True,
+                max_sequence_length=None  # No truncation - let model handle full sequence
+            ).to(self.device)
+        else:
+            # Some sequences are too long (seq_len > max_sequence_length), use truncation
+            # This happens for sliding windows where window_size = max_sequence_length
+            input_ids = self.tokenizer(
+                window_sequences,
+                add_special_tokens=True,
+                return_tensors=True,
+                max_sequence_length=self.max_sequence_length
+            ).to(self.device)
         
         # Compute ESM2-15B embeddings if use_esm is True (matching training setup)
         esm_embedding = None
@@ -273,11 +294,16 @@ class ModelInference:
         hidden_states = self.model.backbone(input_ids, embedding=esm_embedding)
         
         # Extract per-position embeddings (remove CLS and EOS tokens)
+        # 🔧 Fix: Simply remove CLS (position 0) and EOS, get embeddings for all sequence positions
+        # For seq_len=512: tokens are [CLS, seq_0, seq_1, ..., seq_511, EOS]
+        # Extract hidden[1:-1] or hidden[1:eos_pos] to get 512 embeddings
         batch_input_ids = input_ids.cpu()
         eos_token_id = self.tokenizer.ids_to_tokens.index("<eos>")
         window_embeddings = []
         
-        for hidden, input_id in zip(hidden_states, batch_input_ids):
+        for idx, (hidden, input_id) in enumerate(zip(hidden_states, batch_input_ids)):
+            original_len = original_lengths[idx]
+            
             # Find EOS token position
             eos_pos = None
             for pos in range(1, len(input_id)):
@@ -285,10 +311,23 @@ class ModelInference:
                     eos_pos = pos
                     break
             
+            # Extract embeddings: remove CLS (position 0) and EOS (position eos_pos)
+            # hidden[1:eos_pos] gives us embeddings for positions 1 to eos_pos-1
+            # This should equal original_len (since eos_pos = original_len + 1)
             if eos_pos is not None:
                 seq_embeddings = hidden[1:eos_pos].cpu()
             else:
+                # No EOS found, extract all except CLS
                 seq_embeddings = hidden[1:].cpu()
+            
+            if seq_embeddings.shape[0] != original_len:
+                if seq_embeddings.shape[0] < original_len:
+                    # Pad if shorter (shouldn't happen if no truncation)
+                    pad_size = original_len - seq_embeddings.shape[0]
+                    padding = torch.zeros(pad_size, seq_embeddings.shape[1])
+                    seq_embeddings = torch.cat([seq_embeddings, padding], dim=0)
+                else:
+                    raise ValueError(f"Embedding length {seq_embeddings.shape[0]} does not match original length {original_len}")
             
             window_embeddings.append(seq_embeddings)
         
@@ -323,13 +362,42 @@ class ModelInference:
         for seq_idx, sequence in enumerate(tqdm(sequences, desc="Generating per-position embeddings")):
             seq_len = len(sequence)
             
-            # If sequence is short enough or sliding window is disabled, process directly
-            if seq_len <= max_seq_len or not use_sliding_window:
+            # The model can handle max_seq_len tokens (including special tokens)
+            # For seq_len <= max_seq_len (e.g., 512):
+            #   - Sequence: seq_len chars
+            #   - After tokenization: seq_len + 2 special tokens
+            #   - Model processes (seq_len + 2) tokens
+            #   - Extract embeddings: remove CLS and EOS, get seq_len embeddings
+            #   - This matches the original sequence length and labels
+            # For seq_len > max_seq_len, use sliding window
+            
+            # If sequence fits in one window (seq_len <= max_seq_len) or sliding window is disabled
+            if max_seq_len is None or seq_len <= max_seq_len or not use_sliding_window:
                 # Process as single window
+                # Tokenizer will process full sequence without truncation (max_sequence_length=None)
+                # This ensures we get embeddings for all positions
                 window_embeddings = self._process_single_window_batch([sequence])
-                all_embeddings.append(window_embeddings[0])
+                emb = window_embeddings[0]
+                emb_len = emb.shape[0]
+                
+                # Ensure embedding length matches original sequence length
+                # With no truncation, this should always match, but check just in case
+                if emb_len != seq_len:
+                    if emb_len < seq_len:
+                        # Pad to match sequence length (for label alignment)
+                        pad_size = seq_len - emb_len
+                        emb = torch.cat([emb, torch.zeros(pad_size, emb.shape[1])], dim=0)
+                    else:
+                        print(f"Warning: Embedding length {emb_len} does not match original length {seq_len}")
+                        # Truncate if somehow longer
+                        emb = emb[:seq_len]
+                
+                all_embeddings.append(emb)
             else:
-                # Use sliding window for long sequences
+                # Use sliding window for long sequences (seq_len > max_seq_len)
+                # Window size should be max_seq_len (e.g., 512)
+                # Each window will be processed: window_size + 2 special tokens
+                # Tokenizer will handle truncation if needed in _process_single_window_batch
                 windows = self._create_sliding_windows(sequence, max_seq_len, window_overlap)
                 
                 # Process windows in batches

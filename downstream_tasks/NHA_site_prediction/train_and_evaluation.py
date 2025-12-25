@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import json
+import matplotlib.pyplot as plt
 from sklearn.metrics import (
     accuracy_score, 
     precision_recall_fscore_support, 
@@ -226,6 +228,78 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     return total_loss / num_samples if num_samples > 0 else 0.0
 
 
+def plot_training_curves(training_history, save_path):
+    """
+    Plot training curves and save to file.
+    
+    @param training_history: Dictionary containing training history
+    @param save_path: Path to save the plot
+    """
+    epochs = range(1, len(training_history['train_loss']) + 1)
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('Training Curves', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Loss
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, training_history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+    if any(v is not None for v in training_history['valid_loss']):
+        valid_loss = [v if v is not None else np.nan for v in training_history['valid_loss']]
+        ax1.plot(epochs, valid_loss, 'r-', label='Valid Loss', linewidth=2)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Loss Curves', fontsize=14)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: F1 Score
+    ax2 = axes[0, 1]
+    if any(v is not None for v in training_history['valid_f1']):
+        valid_f1 = [v if v is not None else np.nan for v in training_history['valid_f1']]
+        ax2.plot(epochs, valid_f1, 'g-', label='Valid F1', linewidth=2, marker='o', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('F1 Score', fontsize=12)
+    ax2.set_title('F1 Score', fontsize=14)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: AUROC and AUPRC
+    ax3 = axes[1, 0]
+    if any(v is not None for v in training_history['valid_auroc']):
+        valid_auroc = [v if v is not None else np.nan for v in training_history['valid_auroc']]
+        ax3.plot(epochs, valid_auroc, 'm-', label='Valid AUROC', linewidth=2, marker='s', markersize=4)
+    if any(v is not None for v in training_history['valid_auprc']):
+        valid_auprc = [v if v is not None else np.nan for v in training_history['valid_auprc']]
+        ax3.plot(epochs, valid_auprc, 'c-', label='Valid AUPRC', linewidth=2, marker='^', markersize=4)
+    ax3.set_xlabel('Epoch', fontsize=12)
+    ax3.set_ylabel('Score', fontsize=12)
+    ax3.set_title('AUROC and AUPRC', fontsize=14)
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Accuracy, Precision, Recall
+    ax4 = axes[1, 1]
+    if any(v is not None for v in training_history['valid_accuracy']):
+        valid_acc = [v if v is not None else np.nan for v in training_history['valid_accuracy']]
+        ax4.plot(epochs, valid_acc, 'orange', label='Valid Accuracy', linewidth=2, marker='o', markersize=4)
+    if any(v is not None for v in training_history['valid_precision']):
+        valid_prec = [v if v is not None else np.nan for v in training_history['valid_precision']]
+        ax4.plot(epochs, valid_prec, 'purple', label='Valid Precision', linewidth=2, marker='s', markersize=4)
+    if any(v is not None for v in training_history['valid_recall']):
+        valid_rec = [v if v is not None else np.nan for v in training_history['valid_recall']]
+        ax4.plot(epochs, valid_rec, 'brown', label='Valid Recall', linewidth=2, marker='^', markersize=4)
+    ax4.set_xlabel('Epoch', fontsize=12)
+    ax4.set_ylabel('Score', fontsize=12)
+    ax4.set_title('Accuracy, Precision, Recall', fontsize=14)
+    ax4.legend(fontsize=10)
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def evaluate(model, dataloader, criterion, device):
     """
     Evaluate the model.
@@ -326,10 +400,10 @@ def evaluate(model, dataloader, criterion, device):
 def main():
     parser = argparse.ArgumentParser(description="Train classification head for NHA site prediction")
     parser.add_argument(
-        "--embeddings_dir",
+        "--output_dir",
         type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/NHA_site_prediction/embeddings",
-        help="Directory containing pre-generated embeddings"
+        default="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs/NHA_site_prediction",
+        help="Output directory. Embeddings will be loaded from output_dir/embeddings/"
     )
     parser.add_argument(
         "--hidden_size",
@@ -362,12 +436,6 @@ def main():
         help="Dropout rate"
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/NHA_site_prediction",
-        help="Output directory for saving trained model"
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -382,18 +450,31 @@ def main():
     
     args = parser.parse_args()
     
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"📁 Output directory: {args.output_dir}")
+    
+    # Automatically find embeddings directory in output_dir
+    embeddings_dir = os.path.join(args.output_dir, "embeddings")
+    if not os.path.exists(embeddings_dir):
+        raise FileNotFoundError(
+            f"Embeddings directory not found: {embeddings_dir}\n"
+            f"Please run generate_embeddings.py first to generate embeddings in {embeddings_dir}"
+        )
+    print(f"📁 Embeddings directory: {embeddings_dir}")
+    
     # Set device
     device = torch.device(args.device)
     print(f"🔧 Using device: {device}")
     
     # Load embeddings, labels, and sequences
     print("📦 Loading embeddings, labels, and sequences...")
-    train_embeddings = torch.load(os.path.join(args.embeddings_dir, "train_embeddings.pt"), weights_only=False)
-    train_labels = torch.load(os.path.join(args.embeddings_dir, "train_labels.pt"), weights_only=False)
+    train_embeddings = torch.load(os.path.join(embeddings_dir, "train_embeddings.pt"), weights_only=False)
+    train_labels = torch.load(os.path.join(embeddings_dir, "train_labels.pt"), weights_only=False)
     
     # Load sequences if available
     train_sequences = None
-    train_seqs_path = os.path.join(args.embeddings_dir, "train_sequences.pt")
+    train_seqs_path = os.path.join(embeddings_dir, "train_sequences.pt")
     if os.path.exists(train_seqs_path):
         train_sequences = torch.load(train_seqs_path, weights_only=False)
         print(f"✅ Loaded {len(train_embeddings)} training samples (with sequences)")
@@ -404,9 +485,9 @@ def main():
     valid_embeddings = None
     valid_labels = None
     valid_sequences = None
-    valid_emb_path = os.path.join(args.embeddings_dir, "valid_embeddings.pt")
-    valid_labels_path = os.path.join(args.embeddings_dir, "valid_labels.pt")
-    valid_seqs_path = os.path.join(args.embeddings_dir, "valid_sequences.pt")
+    valid_emb_path = os.path.join(embeddings_dir, "valid_embeddings.pt")
+    valid_labels_path = os.path.join(embeddings_dir, "valid_labels.pt")
+    valid_seqs_path = os.path.join(embeddings_dir, "valid_sequences.pt")
     if os.path.exists(valid_emb_path) and os.path.exists(valid_labels_path):
         valid_embeddings = torch.load(valid_emb_path, weights_only=False)
         valid_labels = torch.load(valid_labels_path, weights_only=False)
@@ -420,9 +501,9 @@ def main():
     test_embeddings = None
     test_labels = None
     test_sequences = None
-    test_emb_path = os.path.join(args.embeddings_dir, "test_embeddings.pt")
-    test_labels_path = os.path.join(args.embeddings_dir, "test_labels.pt")
-    test_seqs_path = os.path.join(args.embeddings_dir, "test_sequences.pt")
+    test_emb_path = os.path.join(embeddings_dir, "test_embeddings.pt")
+    test_labels_path = os.path.join(embeddings_dir, "test_labels.pt")
+    test_seqs_path = os.path.join(embeddings_dir, "test_sequences.pt")
     if os.path.exists(test_emb_path) and os.path.exists(test_labels_path):
         test_embeddings = torch.load(test_emb_path, weights_only=False)
         test_labels = torch.load(test_labels_path, weights_only=False)
@@ -539,6 +620,19 @@ def main():
     best_f1 = 0.0
     best_model_path = os.path.join(args.output_dir, "trained_head.pt")
     
+    # Training history for saving results
+    training_history = {
+        'train_loss': [],
+        'valid_loss': [],
+        'valid_accuracy': [],
+        'valid_precision': [],
+        'valid_recall': [],
+        'valid_f1': [],
+        'valid_auroc': [],
+        'valid_auprc': [],
+        'valid_mcc': []
+    }
+    
     for epoch in range(args.num_epochs):
         print(f"\n📊 Epoch {epoch + 1}/{args.num_epochs}")
         print("-" * 50)
@@ -546,6 +640,7 @@ def main():
         # Train
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
         print(f"✅ Train Loss: {train_loss:.4f}")
+        training_history['train_loss'].append(float(train_loss))
         
         # Evaluate on validation set if available
         if valid_loader is not None:
@@ -562,6 +657,16 @@ def main():
             print(f"      TN: {valid_metrics['tn']}, FP: {valid_metrics['fp']}")
             print(f"      FN: {valid_metrics['fn']}, TP: {valid_metrics['tp']}")
             
+            # Record validation metrics
+            training_history['valid_loss'].append(float(valid_metrics['loss']))
+            training_history['valid_accuracy'].append(float(valid_metrics['accuracy']))
+            training_history['valid_precision'].append(float(valid_metrics['precision']))
+            training_history['valid_recall'].append(float(valid_metrics['recall']))
+            training_history['valid_f1'].append(float(valid_metrics['f1']))
+            training_history['valid_auroc'].append(float(valid_metrics['auroc']))
+            training_history['valid_auprc'].append(float(valid_metrics['auprc']))
+            training_history['valid_mcc'].append(float(valid_metrics['mcc']))
+            
             # Save best model based on validation F1
             if valid_metrics['f1'] > best_f1:
                 best_f1 = valid_metrics['f1']
@@ -575,14 +680,51 @@ def main():
                 }, best_model_path)
                 print(f"💾 Saved best model (Validation F1: {best_f1:.4f}) to {best_model_path}")
         else:
-            print("⚠️  No validation set available. Cannot save best model.")
+            print("⚠️  No validation set available. Cannot save best model based on validation metrics.")
+            # Fill with None for epochs without validation
+            training_history['valid_loss'].append(None)
+            training_history['valid_accuracy'].append(None)
+            training_history['valid_precision'].append(None)
+            training_history['valid_recall'].append(None)
+            training_history['valid_f1'].append(None)
+            training_history['valid_auroc'].append(None)
+            training_history['valid_auprc'].append(None)
+            training_history['valid_mcc'].append(None)
+    
+    # If no validation set, save the final model anyway
+    if valid_loader is None:
+        print("\n💾 Saving final model (no validation set available)...")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'input_dim': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers,
+            'epoch': args.num_epochs - 1,
+            'note': 'Final model saved without validation metrics'
+        }, best_model_path)
+        print(f"💾 Final model saved to {best_model_path}")
     
     print("\n" + "="*50)
     print("🎉 Training completed!")
-    print(f"📁 Best model saved to: {best_model_path}")
+    print(f"📁 Model saved to: {best_model_path}")
     print("="*50)
     
+    # Save training history to JSON
+    history_path = os.path.join(args.output_dir, "training_history.json")
+    with open(history_path, 'w') as f:
+        json.dump(training_history, f, indent=2)
+    print(f"💾 Training history saved to {history_path}")
+    
+    # Plot and save training curves
+    try:
+        plot_path = os.path.join(args.output_dir, "training_curves.png")
+        plot_training_curves(training_history, plot_path)
+        print(f"📊 Training curves saved to {plot_path}")
+    except Exception as e:
+        print(f"⚠️  Failed to plot training curves: {e}")
+    
     # Load best model and evaluate on test set
+    test_metrics = None
     if test_loader is not None:
         print("\n" + "="*50)
         print("🔮 Evaluating on test set...")
@@ -623,6 +765,61 @@ def main():
         print(f"💾 Test metrics saved to {best_model_path}")
     else:
         print("\n⚠️  Test set not available. Skipping test evaluation.")
+    
+    # Save final evaluation results to JSON
+    results = {
+        'training_config': {
+            'num_epochs': args.num_epochs,
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'dropout': args.dropout,
+            'lambda_weight': args.lambda_weight,
+            'hidden_size': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers
+        },
+        'best_validation_f1': float(best_f1),
+        'training_history': training_history
+    }
+    
+    # Add test metrics if available
+    if test_metrics is not None:
+        results['test_metrics'] = {
+            'loss': float(test_metrics['loss']),
+            'accuracy': float(test_metrics['accuracy']),
+            'precision': float(test_metrics['precision']),
+            'recall': float(test_metrics['recall']),
+            'f1': float(test_metrics['f1']),
+            'auroc': float(test_metrics['auroc']),
+            'auprc': float(test_metrics['auprc']),
+            'mcc': float(test_metrics['mcc']),
+            'confusion_matrix': {
+                'tn': int(test_metrics['tn']),
+                'fp': int(test_metrics['fp']),
+                'fn': int(test_metrics['fn']),
+                'tp': int(test_metrics['tp'])
+            }
+        }
+    
+    # Add best validation metrics if available
+    if valid_loader is not None and len(training_history['valid_f1']) > 0:
+        best_epoch = np.argmax(training_history['valid_f1'])
+        results['best_validation_metrics'] = {
+            'epoch': int(best_epoch + 1),
+            'loss': training_history['valid_loss'][best_epoch],
+            'accuracy': training_history['valid_accuracy'][best_epoch],
+            'precision': training_history['valid_precision'][best_epoch],
+            'recall': training_history['valid_recall'][best_epoch],
+            'f1': training_history['valid_f1'][best_epoch],
+            'auroc': training_history['valid_auroc'][best_epoch],
+            'auprc': training_history['valid_auprc'][best_epoch],
+            'mcc': training_history['valid_mcc'][best_epoch]
+        }
+    
+    results_path = os.path.join(args.output_dir, "evaluation_results.json")
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"💾 Final evaluation results saved to {results_path}")
 
 
 if __name__ == "__main__":

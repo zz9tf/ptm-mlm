@@ -16,6 +16,11 @@ sys.path.insert(0, str(current_dir))
 
 from load_data import load_nha_data, prepare_sequences_and_labels
 
+# Add main_pipeline to path (inference.py needs getters.tokenizer, utils.checkpoint, etc.)
+# These modules are still in main_pipeline
+main_pipeline_path = Path(__file__).parent.parent.parent / "main_pipeline"
+sys.path.insert(0, str(main_pipeline_path))
+
 # Add inference directory to path for shared inference classes
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
@@ -71,8 +76,8 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/NHA_site_prediction/embeddings",
-        help="Output directory for embeddings"
+        default="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs/NHA_site_prediction",
+        help="Output directory. Embeddings will be stored in output_dir/embeddings/"
     )
     parser.add_argument(
         "--batch_size",
@@ -102,8 +107,20 @@ def main():
         help="Overlap ratio between sliding windows (0.0 to 1.0). "
              "Default 0.5 means 50%% overlap."
     )
+    parser.add_argument(
+        "--use_esm",
+        action="store_true",
+        default=False,
+        help="If set, load ESM2-15B and use Mamba+ESM2 combination (matching training setup). "
+             "If not set, use Mamba-only mode. (Default: False, only valid when model_type='mamba')"
+    )
     
     args = parser.parse_args()
+    
+    # Automatically create embeddings subdirectory in output_dir
+    embeddings_dir = os.path.join(args.output_dir, "embeddings")
+    os.makedirs(embeddings_dir, exist_ok=True)
+    print(f"📁 Embeddings will be stored in: {embeddings_dir}")
     
     # Load data (first load to detect sequence columns)
     print("📖 Loading NHA data...")
@@ -127,12 +144,11 @@ def main():
     if args.model_type == "mamba":
         if not MAMBA_AVAILABLE:
             raise ImportError("Mamba inference not available. Please ensure inference.py exists.")
-        # Use Mamba+ESM2-15B combination (matching training setup)
-        # This matches train.py where use_esm=True by default
+        # Use Mamba+ESM2-15B combination if use_esm is True, otherwise use Mamba-only
         inferencer = ModelInference(
             args.checkpoint, 
             max_sequence_length=args.max_sequence_length,
-            use_esm=True  # Use Mamba+ESM2-15B combination (matching training)
+            use_esm=args.use_esm  # Control whether to load ESM2-15B
         )
     elif args.model_type == "esm2":
         if not ESM2_AVAILABLE:
@@ -299,7 +315,6 @@ def main():
     print("\n" + "="*70)
     print("💾 Saving combined data from all sequence columns...")
     print("="*70)
-    os.makedirs(args.output_dir, exist_ok=True)
     
     # Verify final consistency
     assert len(all_train_embeddings) == len(all_train_labels) == len(all_train_sequences), \
@@ -309,28 +324,28 @@ def main():
     assert len(all_test_embeddings) == len(all_test_labels) == len(all_test_sequences), \
         f"Final test mismatch: embeddings={len(all_test_embeddings)}, labels={len(all_test_labels)}, sequences={len(all_test_sequences)}"
     
-    # Save training data
-    train_emb_path = os.path.join(args.output_dir, "train_embeddings.pt")
-    train_labels_path = os.path.join(args.output_dir, "train_labels.pt")
-    train_seqs_path = os.path.join(args.output_dir, "train_sequences.pt")
+    # Save training data (in embeddings subdirectory)
+    train_emb_path = os.path.join(embeddings_dir, "train_embeddings.pt")
+    train_labels_path = os.path.join(embeddings_dir, "train_labels.pt")
+    train_seqs_path = os.path.join(embeddings_dir, "train_sequences.pt")
     torch.save(all_train_embeddings, train_emb_path)
     torch.save(all_train_labels, train_labels_path)
     torch.save(all_train_sequences, train_seqs_path)
     print(f"✅ Saved combined training data: {len(all_train_embeddings)} samples")
     
-    # Save validation data
-    valid_emb_path = os.path.join(args.output_dir, "valid_embeddings.pt")
-    valid_labels_path = os.path.join(args.output_dir, "valid_labels.pt")
-    valid_seqs_path = os.path.join(args.output_dir, "valid_sequences.pt")
+    # Save validation data (in embeddings subdirectory)
+    valid_emb_path = os.path.join(embeddings_dir, "valid_embeddings.pt")
+    valid_labels_path = os.path.join(embeddings_dir, "valid_labels.pt")
+    valid_seqs_path = os.path.join(embeddings_dir, "valid_sequences.pt")
     torch.save(all_valid_embeddings, valid_emb_path)
     torch.save(all_valid_labels, valid_labels_path)
     torch.save(all_valid_sequences, valid_seqs_path)
     print(f"✅ Saved combined validation data: {len(all_valid_embeddings)} samples")
     
-    # Save test data
-    test_emb_path = os.path.join(args.output_dir, "test_embeddings.pt")
-    test_labels_path = os.path.join(args.output_dir, "test_labels.pt")
-    test_seqs_path = os.path.join(args.output_dir, "test_sequences.pt")
+    # Save test data (in embeddings subdirectory)
+    test_emb_path = os.path.join(embeddings_dir, "test_embeddings.pt")
+    test_labels_path = os.path.join(embeddings_dir, "test_labels.pt")
+    test_seqs_path = os.path.join(embeddings_dir, "test_sequences.pt")
     torch.save(all_test_embeddings, test_emb_path)
     torch.save(all_test_labels, test_labels_path)
     torch.save(all_test_sequences, test_seqs_path)

@@ -6,13 +6,30 @@ conda activate ptm-mamba
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 # Exclude GPU 3, use GPUs 1,2,4,5 (will be mapped to 0,1,2,3 by CUDA_VISIBLE_DEVICES)
-export CUDA_VISIBLE_DEVICES="1,2,4,5"
+export CUDA_VISIBLE_DEVICES="5"
 
-# Generate embeddings with 4 GPUs
-# --multi_gpu: Enable multi-GPU mode
-# --num_processes=4: Use 4 processes (one per GPU)
-accelerate launch --num_processes=4 generate_embeddings.py \
+# PTM MASKED sequences
+# python generate_embeddings.py \
+#     --config configs/base.yaml \
+#     --output_dir embeddings \
+#     --batch_size 6 \
+#     --chunk_size_gb 10
+
+# Original sequences
+python generate_embeddings.py \
     --config configs/base.yaml \
+    --use_original_sequence \
+    --original_sequence_column ori_seq \
     --output_dir embeddings \
-    --batch_size 6
+    --batch_size 8 \
+    --chunk_size_gb 10
 
+# Original sequences with ESM3 model
+# python generate_embeddings.py \
+#     --config configs/base.yaml \
+#     --use_original_sequence \
+#     --original_sequence_column ori_seq \
+#     --output_dir embeddings \
+#     --model esm3_7b \
+#     --batch_size 8 \
+#     --chunk_size_gb 100
