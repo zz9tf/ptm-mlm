@@ -321,125 +321,112 @@ def append_chunk_to_h5(chunk_data_by_ac_id, chunk_path, embed_dim, max_seq_len):
     file_exists = os.path.exists(chunk_path)
     lock_path = chunk_path + '.lock'
     
-    # Use file lock to ensure only one process writes at a time
-    max_retries = 10
-    retry_delay = 0.1  # 100ms
-    lock_file = None
-    
-    for retry in range(max_retries):
+    # Use blocking file lock to ensure only one process writes at a time
+    # Blocking lock is better for multi-process scenarios as it automatically waits
+    lock_file = open(lock_path, 'w')
+    try:
+        # Acquire blocking exclusive lock (will wait until available)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        
         try:
-            # Try to acquire lock
-            lock_file = open(lock_path, 'w')
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            
-            try:
-                with h5py.File(chunk_path, 'a') as f:
-                    # Set attributes if file is new
-                    if not file_exists:
-                        f.attrs['embed_dim'] = embed_dim
-                        f.attrs['max_seq_len'] = max_seq_len
+            with h5py.File(chunk_path, 'a') as f:
+                # Set attributes if file is new
+                if not file_exists:
+                    f.attrs['embed_dim'] = embed_dim
+                    f.attrs['max_seq_len'] = max_seq_len
+                
+                # Write each AC_ID as a group
+                for ac_id, data in chunk_data_by_ac_id.items():
+                    # Encode AC_ID for group name (h5py group names must be strings)
+                    group_name = str(ac_id)
                     
-                    # Write each AC_ID as a group
-                    for ac_id, data in chunk_data_by_ac_id.items():
-                        # Encode AC_ID for group name (h5py group names must be strings)
-                        group_name = str(ac_id)
+                    if group_name in f:
+                        # Group exists, append to existing data
+                        group = f[group_name]
+                        existing_embeddings = group['embedding_seq']
+                        existing_ranges = group['range_seq']
+                        existing_ori_seqs = group.get('ori_seq')
+                        existing_ptm_seqs = group.get('ptm_seq')
                         
-                        if group_name in f:
-                            # Group exists, append to existing data
-                            group = f[group_name]
-                            existing_embeddings = group['embedding_seq']
-                            existing_ranges = group['range_seq']
-                            existing_ori_seqs = group.get('ori_seq')
-                            existing_ptm_seqs = group.get('ptm_seq')
-                            
-                            # Append new embeddings and ranges
-                            num_existing = existing_embeddings.shape[0]
-                            num_new = len(data['embeddings'])
-                            new_size = num_existing + num_new
-                            
-                            # Resize and append embeddings
-                            existing_embeddings.resize((new_size,))
-                            for i, emb in enumerate(data['embeddings']):
-                                if emb.shape[0] > max_seq_len:
-                                    raise ValueError(
-                                        f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
-                                        f"for AC_ID {ac_id}, window {i}"
-                                    )
-                                # Pad embedding to max_seq_len
-                                padded_emb = np.zeros((max_seq_len, embed_dim), dtype=np.float32)
-                                padded_emb[:emb.shape[0], :] = emb
-                                existing_embeddings[num_existing + i] = padded_emb
-                            
-                            # Resize and append ranges
-                            existing_ranges.resize((new_size, 2))
-                            for i, (start, end) in enumerate(data['ranges']):
-                                existing_ranges[num_existing + i] = [start, end]
-                            
-                            # Append ori_seq and ptm_seq if they exist
-                            if 'ori_seqs' in data and existing_ori_seqs is not None:
-                                existing_ori_seqs.resize((new_size,))
-                                for i, seq in enumerate(data['ori_seqs']):
-                                    existing_ori_seqs[num_existing + i] = seq
-                            
-                            if 'ptm_seqs' in data and existing_ptm_seqs is not None:
-                                existing_ptm_seqs.resize((new_size,))
-                                for i, seq in enumerate(data['ptm_seqs']):
-                                    existing_ptm_seqs[num_existing + i] = seq
-                        else:
-                            # Create new group
-                            group = f.create_group(group_name)
-                            
-                            # Create datasets for embeddings (variable length, padded to max_seq_len)
-                            num_windows = len(data['embeddings'])
-                            embedding_data = np.zeros((num_windows, max_seq_len, embed_dim), dtype=np.float32)
-                            for i, emb in enumerate(data['embeddings']):
-                                if emb.shape[0] > max_seq_len:
-                                    raise ValueError(
-                                        f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
-                                        f"for AC_ID {ac_id}, window {i}"
-                                    )
-                                embedding_data[i, :emb.shape[0], :] = emb
-                            
-                            group.create_dataset('embedding_seq', data=embedding_data, 
-                                                maxshape=(None, max_seq_len, embed_dim),
-                                                dtype=np.float32, compression='gzip', compression_opts=9)
-                            
-                            # Create dataset for ranges
-                            range_data = np.array(data['ranges'], dtype=np.int32)
-                            group.create_dataset('range_seq', data=range_data, 
-                                                maxshape=(None, 2), dtype=np.int32, compression='gzip')
-                            
-                            # Create datasets for ori_seq and ptm_seq (if available)
-                            # Use variable-length string type for efficient storage
-                            if 'ori_seqs' in data:
-                                ori_seq_data = np.array(data['ori_seqs'], dtype=object)
-                                group.create_dataset('ori_seq', data=ori_seq_data,
-                                                    maxshape=(None,),
-                                                    dtype=vlen_str_dtype, compression='gzip', compression_opts=9)
-                            
-                            if 'ptm_seqs' in data:
-                                ptm_seq_data = np.array(data['ptm_seqs'], dtype=object)
-                                group.create_dataset('ptm_seq', data=ptm_seq_data,
-                                                    maxshape=(None,),
-                                                    dtype=vlen_str_dtype, compression='gzip', compression_opts=9)
-                
-                # Release lock
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
-                break
-            except Exception as e:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
-                raise e
-                
-        except BlockingIOError:
-            # Lock is held by another process, wait and retry
-            if lock_file:
-                lock_file.close()
-            if retry < max_retries - 1:
-                time.sleep(retry_delay)
-            else:
-                raise RuntimeError(f"Failed to acquire lock for {chunk_path} after {max_retries} retries")
+                        # Append new embeddings and ranges
+                        num_existing = existing_embeddings.shape[0]
+                        num_new = len(data['embeddings'])
+                        new_size = num_existing + num_new
+                        
+                        # Resize and append embeddings
+                        existing_embeddings.resize((new_size,))
+                        for i, emb in enumerate(data['embeddings']):
+                            if emb.shape[0] > max_seq_len:
+                                raise ValueError(
+                                    f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
+                                    f"for AC_ID {ac_id}, window {i}"
+                                )
+                            # Pad embedding to max_seq_len
+                            padded_emb = np.zeros((max_seq_len, embed_dim), dtype=np.float32)
+                            padded_emb[:emb.shape[0], :] = emb
+                            existing_embeddings[num_existing + i] = padded_emb
+                        
+                        # Resize and append ranges
+                        existing_ranges.resize((new_size, 2))
+                        for i, (start, end) in enumerate(data['ranges']):
+                            existing_ranges[num_existing + i] = [start, end]
+                        
+                        # Append ori_seq and ptm_seq if they exist
+                        if 'ori_seqs' in data and existing_ori_seqs is not None:
+                            existing_ori_seqs.resize((new_size,))
+                            for i, seq in enumerate(data['ori_seqs']):
+                                existing_ori_seqs[num_existing + i] = seq
+                        
+                        if 'ptm_seqs' in data and existing_ptm_seqs is not None:
+                            existing_ptm_seqs.resize((new_size,))
+                            for i, seq in enumerate(data['ptm_seqs']):
+                                existing_ptm_seqs[num_existing + i] = seq
+                    else:
+                        # Create new group
+                        group = f.create_group(group_name)
+                        
+                        # Create datasets for embeddings (variable length, padded to max_seq_len)
+                        num_windows = len(data['embeddings'])
+                        embedding_data = np.zeros((num_windows, max_seq_len, embed_dim), dtype=np.float32)
+                        for i, emb in enumerate(data['embeddings']):
+                            if emb.shape[0] > max_seq_len:
+                                raise ValueError(
+                                    f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
+                                    f"for AC_ID {ac_id}, window {i}"
+                                )
+                            embedding_data[i, :emb.shape[0], :] = emb
+                        
+                        group.create_dataset('embedding_seq', data=embedding_data, 
+                                            maxshape=(None, max_seq_len, embed_dim),
+                                            dtype=np.float32, compression='gzip', compression_opts=9)
+                        
+                        # Create dataset for ranges
+                        range_data = np.array(data['ranges'], dtype=np.int32)
+                        group.create_dataset('range_seq', data=range_data, 
+                                            maxshape=(None, 2), dtype=np.int32, compression='gzip')
+                        
+                        # Create datasets for ori_seq and ptm_seq (if available)
+                        # Use variable-length string type for efficient storage
+                        if 'ori_seqs' in data:
+                            ori_seq_data = np.array(data['ori_seqs'], dtype=object)
+                            group.create_dataset('ori_seq', data=ori_seq_data,
+                                                maxshape=(None,),
+                                                dtype=vlen_str_dtype, compression='gzip', compression_opts=9)
+                        
+                        if 'ptm_seqs' in data:
+                            ptm_seq_data = np.array(data['ptm_seqs'], dtype=object)
+                            group.create_dataset('ptm_seq', data=ptm_seq_data,
+                                                maxshape=(None,),
+                                                dtype=vlen_str_dtype, compression='gzip', compression_opts=9)
+            
+            # Release lock
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            # Release lock on error
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            raise e
+    finally:
+        lock_file.close()
     
     return max_seq_len
 
@@ -599,6 +586,31 @@ def extract_windows_for_sequence(
     return windows
 
 
+def remove_special_token_embeddings(embedding: np.ndarray, seq_len: int, num_start: int = 1, num_end: int = 1) -> np.ndarray:
+    """
+    Remove special token embeddings (<cls> at start, <eos> at end) from embedding.
+    
+    @param embedding: Embedding array with shape [embed_len, embed_dim]
+    @param seq_len: Expected sequence length (after removing special tokens)
+    @param num_start: Number of special tokens at start (default: 1 for <cls>)
+    @param num_end: Number of special tokens at end (default: 1 for <eos>)
+    @return: Embedding array with special tokens removed
+    """
+    embed_len = embedding.shape[0]
+    expected_with_special = seq_len + num_start + num_end
+    
+    if embed_len == expected_with_special:
+        # Remove special tokens: first num_start and last num_end
+        return embedding[num_start:-num_end] if num_end > 0 else embedding[num_start:]
+    elif embed_len == seq_len:
+        # Already correct length, no special tokens to remove
+        return embedding
+    else:
+        raise ValueError(
+            f"Embedding length mismatch: expected {seq_len} or {expected_with_special}, got {embed_len}"
+        )
+
+
 def process_window_batch(
     window_batch: List[Dict[str, Any]],
     esm_model: torch.nn.Module,
@@ -623,117 +635,45 @@ def process_window_batch(
     @return: List of embeddings (numpy arrays)
     """
     if model_type == "esmc":
-        # ESM C uses different API
-        # Note: ESM C API may not support batch processing or layer specification
-        # We process sequences one by one
-        from esm.sdk.api import ESMProtein, LogitsConfig
+        # ESM C supports batch processing through _tokenize() and forward() methods
+        # Reference: https://github.com/evolutionaryscale/esm/blob/main/esm/models/esmc.py
         
-        embeddings = []
-        for window_info in window_batch:
-            sequence = window_info['window_seq']
-            try:
-                protein = ESMProtein(sequence=sequence)
-                protein_tensor = esm_model.encode(protein)
+        sequences = [w['window_seq'] for w in window_batch]
+        ori_seq_windows = [w['ori_seq_window'] for w in window_batch]
+        
+        # Calculate actual token length for each sequence (sequence + 2 special tokens: <cls> and <eos>)
+        # ESM C tokenizer adds <cls> at start and <eos> at end
+        actual_token_lengths = [len(seq) + 2 for seq in sequences]
+        
+        with torch.no_grad():
+            # Batch tokenize and forward pass
+            # Note: _tokenize() pads all sequences to the same length
+            sequence_tokens = esm_model._tokenize(sequences)
+            output = esm_model.forward(sequence_tokens=sequence_tokens)
+            
+            # Extract embeddings based on repr_layer
+            if repr_layer is not None and repr_layer >= 0:
+                if output.hidden_states is None:
+                    raise ValueError("hidden_states is None")
+                layer_idx = min(repr_layer, output.hidden_states.shape[0] - 1)
+                batch_embeddings = output.hidden_states[layer_idx]  # [batch_size, padded_seq_len, embed_dim]
+            else:
+                if output.embeddings is None:
+                    raise ValueError("embeddings is None")
+                batch_embeddings = output.embeddings  # [batch_size, padded_seq_len, embed_dim]
+            
+            # Process each embedding: extract actual length, remove special tokens, convert to numpy
+            # Convert bfloat16 to float32 before numpy conversion (numpy doesn't support bfloat16)
+            embeddings = []
+            for batch_idx, (ori_seq_window, actual_token_len) in enumerate(zip(ori_seq_windows, actual_token_lengths)):
+                # Extract only the actual sequence part (excluding padding)
+                # actual_token_len includes <cls> and <eos>, so we get: [<cls>, seq_tokens, <eos>]
+                window_emb = batch_embeddings[batch_idx, :actual_token_len, :]  # [actual_token_len, embed_dim]
+                window_emb = window_emb.float().cpu().numpy()
                 
-                # Handle potential errors from encode
-                if hasattr(protein_tensor, 'error'):
-                    if accelerator.is_local_main_process:
-                        accelerator.print(f"⚠️  Error encoding sequence: {protein_tensor.error}")
-                    # Create zero embedding as fallback
-                    window_len = window_info['window_len']
-                    # Get embed_dim from first successful embedding, or use provided embed_dim
-                    fallback_embed_dim = embeddings[0].shape[1] if embeddings else (embed_dim if embed_dim is not None else None)
-                    if fallback_embed_dim is None:
-                        raise RuntimeError("Cannot determine embedding dimension: no successful embeddings and embed_dim not provided")
-                    embeddings.append(np.zeros((window_len, fallback_embed_dim), dtype=np.float32))
-                    continue
-                
-                # Get embeddings using logits API
-                # ESM C returns hidden_states with shape [num_layers, batch_size, seq_len, embed_dim]
-                # We can extract specific layer from hidden_states
-                # If repr_layer is specified, use hidden_states; otherwise use embeddings (last layer)
-                
-                if repr_layer is not None and repr_layer >= 0:
-                    # Extract specific layer from hidden_states
-                    logits_config = LogitsConfig(sequence=True, return_hidden_states=True)
-                    logits_output = esm_model.logits(protein_tensor, logits_config)
-                    
-                    # hidden_states shape: [num_layers, batch_size, seq_len, embed_dim]
-                    hidden_states = logits_output.hidden_states
-                    
-                    # Clamp layer index to valid range
-                    num_layers = hidden_states.shape[0]
-                    layer_idx = min(repr_layer, num_layers - 1)
-                    
-                    # Extract specific layer: [batch_size, seq_len, embed_dim]
-                    window_emb = hidden_states[layer_idx]
-                    
-                    # Remove batch dimension: [1, seq_len, embed_dim] -> [seq_len, embed_dim]
-                    if window_emb.dim() == 3 and window_emb.shape[0] == 1:
-                        window_emb = window_emb.squeeze(0)
-                    
-                    window_emb = window_emb.cpu().numpy()
-                else:
-                    # Use default embeddings (last layer)
-                    logits_config = LogitsConfig(sequence=True, return_embeddings=True)
-                    logits_output = esm_model.logits(protein_tensor, logits_config)
-                    
-                    # Extract embeddings (last layer)
-                    # Note: ESM C returns embeddings with shape [batch_size, seq_len, embed_dim]
-                    window_emb = logits_output.embeddings
-                    if isinstance(window_emb, torch.Tensor):
-                        # Remove batch dimension if present: [1, seq_len, embed_dim] -> [seq_len, embed_dim]
-                        if window_emb.dim() == 3 and window_emb.shape[0] == 1:
-                            window_emb = window_emb.squeeze(0)
-                        window_emb = window_emb.cpu().numpy()
-                    else:
-                        # If it's already a numpy array or other type
-                        if hasattr(window_emb, 'detach'):
-                            window_emb = window_emb.detach().cpu().numpy()
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                        elif hasattr(window_emb, 'numpy'):
-                            window_emb = window_emb.numpy()
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                        elif hasattr(window_emb, '__array__'):
-                            # Convert to numpy if it has __array__ method
-                            window_emb = np.array(window_emb)
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                
-                # Verify embedding shape
-                if len(window_emb.shape) != 2:
-                    raise ValueError(f"Unexpected embedding shape: {window_emb.shape}, expected (seq_len, embed_dim)")
-                
-                # Verify embedding length matches sequence length
-                ori_seq_window = window_info['ori_seq_window']
-                actual_seq_len = len(ori_seq_window)
-                embedding_len = window_emb.shape[0]
-                
-                if embedding_len != actual_seq_len:
-                    raise ValueError(
-                        f"Embedding length mismatch: expected {actual_seq_len} (sequence length), "
-                        f"got {embedding_len} (embedding length) for sequence '{sequence[:50]}...'"
-                    )
-                
+                # Remove special tokens: <cls> (first) and <eos> (last)
+                window_emb = remove_special_token_embeddings(window_emb, len(ori_seq_window))
                 embeddings.append(window_emb)
-            except Exception as e:
-                if accelerator.is_local_main_process:
-                    accelerator.print(f"⚠️  Error processing sequence '{sequence[:50]}...': {e}")
-                    import traceback
-                    traceback.print_exc()
-                # Create zero embedding as fallback
-                window_len = window_info['window_len']
-                # Try to get embed_dim from first successful embedding, or use provided embed_dim
-                if embeddings:
-                    fallback_embed_dim = embeddings[0].shape[1]
-                elif embed_dim is not None:
-                    fallback_embed_dim = embed_dim
-                else:
-                    # This should not happen if embed_dim is properly set from model
-                    raise RuntimeError("Cannot determine embedding dimension: no successful embeddings and embed_dim not provided")
-                embeddings.append(np.zeros((window_len, fallback_embed_dim), dtype=np.float32))
         
         return embeddings
     else:
@@ -742,51 +682,37 @@ def process_window_batch(
         esm_inputs = [(i, w['window_seq']) for i, w in enumerate(window_batch)]
         
         # Compute ESM embeddings
+        # batch_converter automatically adds <cls> at the beginning and <eos> at the end
+        # We let the model process tokens with special tokens (as designed), then remove them from embeddings
         batch_labels, batch_strs, batch_tokens = batch_converter(esm_inputs)
+        batch_tokens = batch_tokens.to(device)
         
-        # Handle token format differences and remove special tokens
-        # ESM2/ESM3 batch_converter adds <cls> at the beginning and <eos> at the end
-        # We need to remove these special tokens from both tokens and embeddings
-        num_special_tokens_start = 1  # <cls> at the beginning
-        num_special_tokens_end = 1    # <eos> at the end
-        
-        if model_type == "esm2":
-            # Remove <cls> and <eos> tokens: [<cls>, seq_tokens, <eos>] -> [seq_tokens]
-            batch_tokens = batch_tokens[..., num_special_tokens_start:-num_special_tokens_end].to(device)
-        elif model_type == "esm3":
-            batch_tokens = batch_tokens.to(device)
-            max_window_len = max(w['window_len'] for w in window_batch)
-            # Check if special tokens are present (length > expected)
-            if batch_tokens.shape[-1] > max_window_len + num_special_tokens_start + num_special_tokens_end:
-                batch_tokens = batch_tokens[..., num_special_tokens_start:-num_special_tokens_end]
-        
-        # Extract embeddings (these will have the same length as batch_tokens after removing special tokens)
+        # Extract embeddings (with special tokens included)
         batch_embeddings = extract_esm_embeddings(
             esm_model, batch_tokens, repr_layer, model_type, accelerator
         )
         
-        # Convert to numpy and extract actual window lengths
-        # Note: batch_embeddings length should match batch_tokens length (after removing special tokens)
-        # We use the original sequence length (characters) to determine how many embeddings to keep
+        # Remove special token embeddings at the end (unified approach)
+        # ESM2/ESM3 add <cls> at the beginning and <eos> at the end
+        num_special_tokens_start = 1  # <cls> at the beginning
+        num_special_tokens_end = 1    # <eos> at the end
+        
         embeddings = []
         for batch_idx, window_info in enumerate(window_batch):
-            # Get the actual sequence length (characters, not tokens)
-            # This is the length of the original sequence window, which should match the number of embeddings
             ori_seq_window = window_info['ori_seq_window']
             actual_seq_len = len(ori_seq_window)  # Character length of original sequence
             
-            window_emb = batch_embeddings[batch_idx]  # Shape: (token_len, embed_dim)
+            window_emb = batch_embeddings[batch_idx].cpu().numpy()  # Shape: (token_len, embed_dim)
             
-            # Verify embedding length matches sequence length
-            embedding_len = window_emb.shape[0]
-            if embedding_len != actual_seq_len:
-                raise ValueError(
-                    f"Embedding length mismatch: expected {actual_seq_len} (sequence length), "
-                    f"got {embedding_len} (embedding length) for sequence '{window_info['window_seq'][:50]}...'"
-                )
+            # Remove special tokens from embeddings (unified with ESM C approach)
+            window_emb = remove_special_token_embeddings(
+                window_emb, 
+                actual_seq_len, 
+                num_special_tokens_start, 
+                num_special_tokens_end
+            )
             
-            window_emb_actual = window_emb.cpu().numpy()
-            embeddings.append(window_emb_actual)
+            embeddings.append(window_emb)
         
         return embeddings
 
@@ -1238,8 +1164,8 @@ def main():
         "--model",
         type=str,
         default="esm2_15b",
-        choices=["esm2_650m", "esm2_15b", "esm3_7b", "esmc_300m"],
-        help="ESM model to use: 'esm2_650m' (ESM2 650M), 'esm2_15b' (ESM2 15B), 'esm3_7b' (ESM3 7B), or 'esmc_300m' (ESM C 300M). Default: 'esm2_15b'",
+        choices=["esm2_650m", "esm2_15b", "esm3_7b", "esmc_300m", "esmc_600m"],
+        help="ESM model to use: 'esm2_650m' (ESM2 650M), 'esm2_15b' (ESM2 15B), 'esm3_7b' (ESM3 7B), 'esmc_300m' (ESM C 300M), or 'esmc_600m' (ESM C 600M). Default: 'esm2_15b'",
     )
     parser.add_argument(
         "--repr_layer",

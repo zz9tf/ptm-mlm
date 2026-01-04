@@ -94,6 +94,7 @@ def get_esm_embed_dim(model_name: str, repr_layer: Optional[int] = None) -> int:
         "esm2_15b": 5120,
         "esm3_7b": 2560,  # ESM3 7B typically has 2560 dimensions
         "esmc_300m": 640,  # ESM C 300M typically has 640 dimensions
+        "esmc_600m": 640,  # ESM C 600M typically has 640 dimensions
     }
     
     # Return known dimension (fast, no model loading needed)
@@ -106,9 +107,9 @@ def get_esm_embed_dim(model_name: str, repr_layer: Optional[int] = None) -> int:
 
 def load_esm_model(model_name: str, accelerator: Accelerator, repr_layer_override: Optional[int] = None) -> Tuple[Any, Any, Any, Optional[int], str, int]:
     """
-    Load ESM model (ESM2 650M, ESM2 15B, ESM3 7B, or ESM C 300M) based on model name.
+    Load ESM model (ESM2 650M, ESM2 15B, ESM3 7B, ESM C 300M, or ESM C 600M) based on model name.
     
-    @param model_name: Model name ('esm2_650m', 'esm2_15b', 'esm3_7b', or 'esmc_300m')
+    @param model_name: Model name ('esm2_650m', 'esm2_15b', 'esm3_7b', 'esmc_300m', or 'esmc_600m')
     @param accelerator: Accelerator instance for logging
     @param repr_layer_override: Optional layer index to override default (None = use default)
     @return: Tuple of (esm_model, alphabet, batch_converter, repr_layer, model_type, embed_dim)
@@ -159,8 +160,21 @@ def load_esm_model(model_name: str, accelerator: Accelerator, repr_layer_overrid
             if accelerator.is_local_main_process:
                 accelerator.print(f"❌ Failed to load ESM C 300M model: {e}")
             raise RuntimeError(f"Could not load ESM C 300M model. Please check if the model is available.")
+    elif model_name == "esmc_600m":
+        # Load ESM C 600M model
+        try:
+            from esm.models.esmc import ESMC
+            esm_model = ESMC.from_pretrained("esmc_600m")
+            # ESM C uses a different API, we'll handle it separately
+            alphabet = None  # ESM C doesn't use alphabet in the same way
+            default_repr_layer = None  # ESM C uses last layer by default
+            model_type = "esmc"
+        except Exception as e:
+            if accelerator.is_local_main_process:
+                accelerator.print(f"❌ Failed to load ESM C 600M model: {e}")
+            raise RuntimeError(f"Could not load ESM C 600M model. Please check if the model is available.")
     else:
-        raise ValueError(f"Unknown model name: {model_name}. Supported: 'esm2_650m', 'esm2_15b', 'esm3_7b', 'esmc_300m'")
+        raise ValueError(f"Unknown model name: {model_name}. Supported: 'esm2_650m', 'esm2_15b', 'esm3_7b', 'esmc_300m', 'esmc_600m'")
     
     # Initialize embed_dim as None - will be determined dynamically
     embed_dim = None
