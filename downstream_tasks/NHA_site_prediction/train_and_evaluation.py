@@ -5,14 +5,16 @@ This script loads embeddings and labels, then trains a classification head for s
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import argparse
 import os
+import csv
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import json
 import matplotlib.pyplot as plt
+from collections import defaultdict
 from sklearn.metrics import (
     accuracy_score, 
     precision_recall_fscore_support, 
@@ -77,6 +79,62 @@ class CombinedLoss(nn.Module):
         return total_loss
 
 
+class LengthGroupedBatchSampler(Sampler):
+    """
+    Batch sampler that groups samples by sequence length to ensure all samples
+    in a batch have the same length. This is required for GNNTrans to correctly
+    calculate center node positions using data.seq[0].
+    
+    @param dataset: EmbeddingDataset instance
+    @param batch_size: Batch size
+    @param shuffle: Whether to shuffle within each length group (reshuffles each epoch)
+    """
+    
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Group indices by sequence length
+        self.length_groups = {}
+        for idx in range(len(dataset)):
+            seq_len = dataset.embeddings_list[idx].shape[0]
+            if seq_len not in self.length_groups:
+                self.length_groups[seq_len] = []
+            self.length_groups[seq_len].append(idx)
+    
+    def __iter__(self):
+        """
+        Generate batches for one epoch.
+        Each batch contains samples with the same sequence length.
+        """
+        # Create batches: each batch contains samples from the same length group
+        batches = []
+        for length, indices in self.length_groups.items():
+            # Shuffle indices within this length group if requested
+            if self.shuffle:
+                indices = indices.copy()
+                np.random.shuffle(indices)
+            
+            # Split indices into batches
+            for i in range(0, len(indices), self.batch_size):
+                batch_indices = indices[i:i + self.batch_size]
+                batches.append(batch_indices)
+        
+        # Shuffle batches if requested (so different length groups are interleaved)
+        if self.shuffle:
+            np.random.shuffle(batches)
+        
+        return iter(batches)
+    
+    def __len__(self):
+        """Return the number of batches."""
+        total_batches = 0
+        for indices in self.length_groups.values():
+            total_batches += (len(indices) + self.batch_size - 1) // self.batch_size
+        return total_batches
+
+
 class EmbeddingDataset(Dataset):
     """
     Dataset class for per-position embeddings, labels, and sequences.
@@ -126,6 +184,9 @@ def collate_fn(batch):
     Collate function for per-position embeddings, converting to graph format for GNNTrans.
     Each amino acid position is a node, connected in a chain: 0-1, 1-2, 2-3, ...
     
+    NOTE: This function assumes all sequences in the batch have the same length.
+    This is ensured by using LengthGroupedBatchSampler in the DataLoader.
+    
     @param batch: List of (embeddings, label, sequence) tuples
     @returns: Tuple of (graph_batch, labels_tensor)
     """
@@ -157,6 +218,8 @@ def collate_fn(batch):
         # Use the real sequence data
         # GNNTrans uses data.seq[0] to find center position: idx = (data.ptr + int(len(data.seq[0]) / 2))[:-1]
         # This will select the middle node of each sequence
+        # Since LengthGroupedBatchSampler ensures all sequences in a batch have the same length,
+        # data.seq[0] will work correctly for all graphs in the batch
         seq = [sequence]  # Real sequence data
         
         data = Data(
@@ -397,6 +460,312 @@ def evaluate(model, dataloader, criterion, device):
     }
 
 
+def write_metrics_to_csv(summary: dict, output_path: Path, metrics_type: str = 'test'):
+    """
+    Write metrics to CSV file.
+    
+    @param summary: Summary dictionary containing length groups data
+    @param output_path: Output directory path
+    @param metrics_type: Type of metrics to export ('test' or 'validation')
+    @returns: Path to the created CSV file
+    """
+    csv_filename = f"length_groups_summary_{metrics_type}.csv"
+    csv_path = output_path / csv_filename
+    
+    # Define CSV columns
+    columns = ['Length', 'Loss', 'Accuracy', 'Precision', 'Recall', 'F1', 'AUROC', 'AUPRC', 'MCC']
+    
+    # Write CSV file
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # Write header
+        writer.writerow(columns)
+        
+        # Write data rows
+        for seq_len in sorted(summary['length_groups'].keys(), key=int):
+            group = summary['length_groups'][seq_len]
+            
+            if metrics_type == 'test':
+                metrics = group.get('test_metrics', {})
+            else:
+                metrics = group.get('best_validation_metrics', {})
+            
+            if metrics:
+                # Format numbers with 4 decimal places for CSV
+                row = [
+                    int(seq_len),
+                    round(metrics.get('loss'), 4) if metrics.get('loss') is not None else "N/A",
+                    round(metrics.get('accuracy'), 4) if metrics.get('accuracy') is not None else "N/A",
+                    round(metrics.get('precision'), 4) if metrics.get('precision') is not None else "N/A",
+                    round(metrics.get('recall'), 4) if metrics.get('recall') is not None else "N/A",
+                    round(metrics.get('f1'), 4) if metrics.get('f1') is not None else "N/A",
+                    round(metrics.get('auroc'), 4) if metrics.get('auroc') is not None else "N/A",
+                    round(metrics.get('auprc'), 4) if metrics.get('auprc') is not None else "N/A",
+                    round(metrics.get('mcc'), 4) if metrics.get('mcc') is not None else "N/A"
+                ]
+            else:
+                row = [int(seq_len)] + ['N/A'] * 8
+            
+            writer.writerow(row)
+    
+    print(f"💾 {metrics_type.capitalize()} metrics CSV saved to: {csv_path}")
+    return csv_path
+
+
+def train_single_length_group(
+    train_embeddings, train_labels, train_sequences,
+    valid_embeddings, valid_labels, valid_sequences,
+    test_embeddings, test_labels, test_sequences,
+    args, device, seq_length, length_output_dir
+):
+    """
+    Train a model for a single sequence length group.
+    
+    @param train_embeddings: List of training embeddings for this length group
+    @param train_labels: List of training labels for this length group
+    @param train_sequences: List of training sequences for this length group
+    @param valid_embeddings: List of validation embeddings for this length group (can be None)
+    @param valid_labels: List of validation labels for this length group (can be None)
+    @param valid_sequences: List of validation sequences for this length group (can be None)
+    @param test_embeddings: List of test embeddings for this length group (can be None)
+    @param test_labels: List of test labels for this length group (can be None)
+    @param test_sequences: List of test sequences for this length group (can be None)
+    @param args: Command line arguments
+    @param device: Device to use for training
+    @param seq_length: Sequence length for this group
+    @param length_output_dir: Output directory for this length group
+    @returns: Dictionary with training results
+    """
+    print(f"\n{'='*70}")
+    print(f"🎯 Training model for sequence length: {seq_length}")
+    print(f"   Train samples: {len(train_embeddings)}")
+    if valid_embeddings:
+        print(f"   Valid samples: {len(valid_embeddings)}")
+    if test_embeddings:
+        print(f"   Test samples: {len(test_embeddings)}")
+    print(f"{'='*70}")
+    
+    # Create output directory for this length group
+    os.makedirs(length_output_dir, exist_ok=True)
+    
+    # Create dataset and dataloader for training
+    train_dataset = EmbeddingDataset(train_embeddings, train_labels, train_sequences)
+    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+    
+    # Create dataset and dataloader for validation if available
+    valid_loader = None
+    if valid_embeddings is not None and valid_labels is not None:
+        valid_dataset = EmbeddingDataset(valid_embeddings, valid_labels, valid_sequences)
+        valid_sampler = LengthGroupedBatchSampler(valid_dataset, batch_size=args.batch_size, shuffle=False)
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_sampler=valid_sampler,
+            collate_fn=collate_fn,
+            num_workers=0
+        )
+    
+    # Create dataset and dataloader for test if available
+    test_loader = None
+    if test_embeddings is not None and test_labels is not None:
+        test_dataset = EmbeddingDataset(test_embeddings, test_labels, test_sequences)
+        test_sampler = LengthGroupedBatchSampler(test_dataset, batch_size=args.batch_size, shuffle=False)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_sampler=test_sampler,
+            collate_fn=collate_fn,
+            num_workers=0
+        )
+    
+    # Initialize GNNTrans model
+    hidden_dim = 128
+    num_layers = 3
+    
+    model = GNNTrans(
+        input_dim=args.hidden_size,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers
+    ).to(device)
+    
+    # Calculate pos_weight for imbalanced data
+    total_positive = sum(train_labels)
+    total_negative = len(train_labels) - total_positive
+    
+    if total_positive > 0 and total_negative > 0:
+        pos_weight = total_negative / total_positive
+        criterion = CombinedLoss(
+            pos_weight=pos_weight,
+            lambda_weight=args.lambda_weight,
+            device=device
+        )
+    else:
+        criterion = CombinedLoss(
+            pos_weight=None,
+            lambda_weight=args.lambda_weight,
+            device=device
+        )
+    
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    # Training loop
+    best_f1 = 0.0
+    best_model_path = os.path.join(length_output_dir, "trained_head.pt")
+    
+    training_history = {
+        'train_loss': [],
+        'valid_loss': [],
+        'valid_accuracy': [],
+        'valid_precision': [],
+        'valid_recall': [],
+        'valid_f1': [],
+        'valid_auroc': [],
+        'valid_auprc': [],
+        'valid_mcc': []
+    }
+    
+    for epoch in range(args.num_epochs):
+        # Train
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        training_history['train_loss'].append(float(train_loss))
+        
+        # Evaluate on validation set if available
+        if valid_loader is not None:
+            valid_metrics = evaluate(model, valid_loader, criterion, device)
+            training_history['valid_loss'].append(float(valid_metrics['loss']))
+            training_history['valid_accuracy'].append(float(valid_metrics['accuracy']))
+            training_history['valid_precision'].append(float(valid_metrics['precision']))
+            training_history['valid_recall'].append(float(valid_metrics['recall']))
+            training_history['valid_f1'].append(float(valid_metrics['f1']))
+            training_history['valid_auroc'].append(float(valid_metrics['auroc']))
+            training_history['valid_auprc'].append(float(valid_metrics['auprc']))
+            training_history['valid_mcc'].append(float(valid_metrics['mcc']))
+            
+            # Save best model based on validation F1
+            if valid_metrics['f1'] > best_f1:
+                best_f1 = valid_metrics['f1']
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'input_dim': args.hidden_size,
+                    'hidden_dim': hidden_dim,
+                    'num_layers': num_layers,
+                    'epoch': epoch,
+                    'valid_metrics': valid_metrics,
+                    'sequence_length': seq_length
+                }, best_model_path)
+        else:
+            training_history['valid_loss'].append(None)
+            training_history['valid_accuracy'].append(None)
+            training_history['valid_precision'].append(None)
+            training_history['valid_recall'].append(None)
+            training_history['valid_f1'].append(None)
+            training_history['valid_auroc'].append(None)
+            training_history['valid_auprc'].append(None)
+            training_history['valid_mcc'].append(None)
+    
+    # If no validation set, save the final model anyway
+    if valid_loader is None:
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'input_dim': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers,
+            'epoch': args.num_epochs - 1,
+            'note': 'Final model saved without validation metrics',
+            'sequence_length': seq_length
+        }, best_model_path)
+    
+    # Save training history
+    history_path = os.path.join(length_output_dir, "training_history.json")
+    with open(history_path, 'w') as f:
+        json.dump(training_history, f, indent=2)
+    
+    # Plot training curves
+    try:
+        plot_path = os.path.join(length_output_dir, "training_curves.png")
+        plot_training_curves(training_history, plot_path)
+    except Exception as e:
+        print(f"⚠️  Failed to plot training curves: {e}")
+    
+    # Evaluate on test set
+    test_metrics = None
+    if test_loader is not None:
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        saved_input_dim = checkpoint.get('input_dim', args.hidden_size)
+        saved_hidden_dim = checkpoint.get('hidden_dim', hidden_dim)
+        saved_num_layers = checkpoint.get('num_layers', num_layers)
+        model = GNNTrans(
+            input_dim=saved_input_dim,
+            hidden_dim=saved_hidden_dim,
+            num_layers=saved_num_layers
+        ).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        test_metrics = evaluate(model, test_loader, criterion, device)
+        checkpoint['test_metrics'] = test_metrics
+        torch.save(checkpoint, best_model_path)
+    
+    # Save final evaluation results
+    results = {
+        'sequence_length': seq_length,
+        'training_config': {
+            'num_epochs': args.num_epochs,
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'dropout': args.dropout,
+            'lambda_weight': args.lambda_weight,
+            'hidden_size': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers
+        },
+        'best_validation_f1': float(best_f1),
+        'training_history': training_history
+    }
+    
+    if test_metrics is not None:
+        results['test_metrics'] = {
+            'loss': float(test_metrics['loss']),
+            'accuracy': float(test_metrics['accuracy']),
+            'precision': float(test_metrics['precision']),
+            'recall': float(test_metrics['recall']),
+            'f1': float(test_metrics['f1']),
+            'auroc': float(test_metrics['auroc']),
+            'auprc': float(test_metrics['auprc']),
+            'mcc': float(test_metrics['mcc']),
+            'confusion_matrix': {
+                'tn': int(test_metrics['tn']),
+                'fp': int(test_metrics['fp']),
+                'fn': int(test_metrics['fn']),
+                'tp': int(test_metrics['tp'])
+            }
+        }
+    
+    if valid_loader is not None and len(training_history['valid_f1']) > 0:
+        best_epoch = np.argmax(training_history['valid_f1'])
+        results['best_validation_metrics'] = {
+            'epoch': int(best_epoch + 1),
+            'loss': training_history['valid_loss'][best_epoch],
+            'accuracy': training_history['valid_accuracy'][best_epoch],
+            'precision': training_history['valid_precision'][best_epoch],
+            'recall': training_history['valid_recall'][best_epoch],
+            'f1': training_history['valid_f1'][best_epoch],
+            'auroc': training_history['valid_auroc'][best_epoch],
+            'auprc': training_history['valid_auprc'][best_epoch],
+            'mcc': training_history['valid_mcc'][best_epoch]
+        }
+    
+    results_path = os.path.join(length_output_dir, "evaluation_results.json")
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train classification head for NHA site prediction")
     parser.add_argument(
@@ -446,6 +815,15 @@ def main():
         type=float,
         default=0.5,
         help="Weight (λ) for AUCMLoss in combined loss. Formula: loss = bce_loss + λ * auc_loss (default: 0.5)"
+    )
+    parser.add_argument(
+        "--train_by_length_groups",
+        action="store_true",
+        default=False,
+        help="Train separate models for each sequence length group. "
+             "When enabled, data will be split by sequence length and a separate model "
+             "will be trained for each length group. This ensures stable training with "
+             "consistent sequence lengths. Models will be saved in length-specific subdirectories."
     )
     
     args = parser.parse_args()
@@ -531,12 +909,282 @@ def main():
         else:
             raise ValueError("Cannot infer hidden_size from embeddings. Please provide --hidden_size")
     
+    # Check if we should train by length groups
+    if args.train_by_length_groups:
+        print("\n" + "="*70)
+        print("🔀 Training by Length Groups Mode")
+        print("="*70)
+        
+        # Group data by sequence length
+        # Group training data by length
+        train_groups = defaultdict(lambda: {'embeddings': [], 'labels': [], 'sequences': []})
+        for emb, label, seq in zip(train_embeddings, train_labels, train_sequences):
+            seq_len = emb.shape[0]
+            train_groups[seq_len]['embeddings'].append(emb)
+            train_groups[seq_len]['labels'].append(label)
+            train_groups[seq_len]['sequences'].append(seq)
+        
+        # Group validation data by length
+        valid_groups = defaultdict(lambda: {'embeddings': [], 'labels': [], 'sequences': []})
+        if valid_embeddings is not None:
+            for emb, label, seq in zip(valid_embeddings, valid_labels, valid_sequences):
+                seq_len = emb.shape[0]
+                valid_groups[seq_len]['embeddings'].append(emb)
+                valid_groups[seq_len]['labels'].append(label)
+                valid_groups[seq_len]['sequences'].append(seq)
+        
+        # Group test data by length
+        test_groups = defaultdict(lambda: {'embeddings': [], 'labels': [], 'sequences': []})
+        if test_embeddings is not None:
+            for emb, label, seq in zip(test_embeddings, test_labels, test_sequences):
+                seq_len = emb.shape[0]
+                test_groups[seq_len]['embeddings'].append(emb)
+                test_groups[seq_len]['labels'].append(label)
+                test_groups[seq_len]['sequences'].append(seq)
+        
+        # Print length group statistics
+        all_lengths = sorted(set(list(train_groups.keys()) + list(valid_groups.keys()) + list(test_groups.keys())))
+        print(f"📊 Found {len(all_lengths)} different sequence lengths: {all_lengths}")
+        for seq_len in all_lengths:
+            train_count = len(train_groups[seq_len]['embeddings'])
+            valid_count = len(valid_groups[seq_len]['embeddings']) if seq_len in valid_groups else 0
+            test_count = len(test_groups[seq_len]['embeddings']) if seq_len in test_groups else 0
+            print(f"   Length {seq_len}: Train={train_count}, Valid={valid_count}, Test={test_count}")
+        
+        # Train a separate model for each length group
+        all_results = {}
+        for seq_len in sorted(all_lengths):
+            length_output_dir = os.path.join(args.output_dir, f"length_{seq_len}")
+            
+            train_emb_group = train_groups[seq_len]['embeddings']
+            train_labels_group = train_groups[seq_len]['labels']
+            train_seqs_group = train_groups[seq_len]['sequences']
+            
+            valid_emb_group = valid_groups[seq_len]['embeddings'] if seq_len in valid_groups else None
+            valid_labels_group = valid_groups[seq_len]['labels'] if seq_len in valid_groups else None
+            valid_seqs_group = valid_groups[seq_len]['sequences'] if seq_len in valid_groups else None
+            
+            test_emb_group = test_groups[seq_len]['embeddings'] if seq_len in test_groups else None
+            test_labels_group = test_groups[seq_len]['labels'] if seq_len in test_groups else None
+            test_seqs_group = test_groups[seq_len]['sequences'] if seq_len in test_groups else None
+            
+            # Skip if no training samples for this length
+            if len(train_emb_group) == 0:
+                print(f"⚠️  Skipping length {seq_len}: no training samples")
+                continue
+            
+            # Train model for this length group
+            results = train_single_length_group(
+                train_emb_group, train_labels_group, train_seqs_group,
+                valid_emb_group, valid_labels_group, valid_seqs_group,
+                test_emb_group, test_labels_group, test_seqs_group,
+                args, device, seq_len, length_output_dir
+            )
+            all_results[seq_len] = results
+        
+        # Save summary of all length groups
+        summary = {
+            'training_mode': 'by_length_groups',
+            'total_length_groups': len(all_results),
+            'length_groups': {}
+        }
+        
+        for seq_len, results in all_results.items():
+            # Extract best validation metrics
+            best_val_metrics = results.get('best_validation_metrics', {})
+            
+            # Extract test metrics
+            test_metrics = results.get('test_metrics', {})
+            
+            summary['length_groups'][seq_len] = {
+                'output_dir': os.path.join(args.output_dir, f"length_{seq_len}"),
+                'best_validation_metrics': {
+                    'loss': best_val_metrics.get('loss'),
+                    'accuracy': best_val_metrics.get('accuracy'),
+                    'precision': best_val_metrics.get('precision'),
+                    'recall': best_val_metrics.get('recall'),
+                    'f1': best_val_metrics.get('f1'),
+                    'auroc': best_val_metrics.get('auroc'),
+                    'auprc': best_val_metrics.get('auprc'),
+                    'mcc': best_val_metrics.get('mcc'),
+                    'epoch': best_val_metrics.get('epoch')
+                },
+                'test_metrics': {
+                    'loss': test_metrics.get('loss'),
+                    'accuracy': test_metrics.get('accuracy'),
+                    'precision': test_metrics.get('precision'),
+                    'recall': test_metrics.get('recall'),
+                    'f1': test_metrics.get('f1'),
+                    'auroc': test_metrics.get('auroc'),
+                    'auprc': test_metrics.get('auprc'),
+                    'mcc': test_metrics.get('mcc'),
+                    'confusion_matrix': test_metrics.get('confusion_matrix', {})
+                }
+            }
+        
+        # Find best model based on AUPRC and MCC (user's preferred metrics)
+        # Priority: AUPRC first, then MCC as tiebreaker
+        best_length = None
+        best_auprc = None
+        best_mcc = None
+        best_model_info = None
+        
+        for seq_len, group in summary['length_groups'].items():
+            test_metrics = group.get('test_metrics', {})
+            if test_metrics:
+                auprc = test_metrics.get('auprc')
+                mcc = test_metrics.get('mcc')
+                
+                if auprc is not None:
+                    # Select based on AUPRC first, then MCC as tiebreaker
+                    if best_auprc is None:
+                        best_auprc = auprc
+                        best_mcc = mcc if mcc is not None else 0
+                        best_length = int(seq_len)
+                        best_model_info = {
+                            'length': int(seq_len),
+                            'output_dir': group.get('output_dir'),
+                            'best_validation_metrics': group.get('best_validation_metrics'),
+                            'test_metrics': group.get('test_metrics')
+                        }
+                    elif auprc > best_auprc:
+                        # Better AUPRC
+                        best_auprc = auprc
+                        best_mcc = mcc if mcc is not None else 0
+                        best_length = int(seq_len)
+                        best_model_info = {
+                            'length': int(seq_len),
+                            'output_dir': group.get('output_dir'),
+                            'best_validation_metrics': group.get('best_validation_metrics'),
+                            'test_metrics': group.get('test_metrics')
+                        }
+                    elif auprc == best_auprc and mcc is not None:
+                        # Same AUPRC, use MCC as tiebreaker
+                        if best_mcc is None or mcc > best_mcc:
+                            best_mcc = mcc
+                            best_length = int(seq_len)
+                            best_model_info = {
+                                'length': int(seq_len),
+                                'output_dir': group.get('output_dir'),
+                                'best_validation_metrics': group.get('best_validation_metrics'),
+                                'test_metrics': group.get('test_metrics')
+                            }
+        
+        # Add best model to summary (based on AUPRC and MCC)
+        if best_model_info:
+            summary['best_model'] = {
+                'selection_criterion': 'test_auprc_and_mcc',
+                'test_auprc': best_auprc,
+                'test_mcc': best_mcc,
+                **best_model_info
+            }
+        
+        # Export to CSV files
+        print(f"\n💾 Total length groups: {len(summary['length_groups'])}")
+        output_path = Path(args.output_dir)
+        validation_csv_path = write_metrics_to_csv(summary, output_path, 'validation')
+        test_csv_path = write_metrics_to_csv(summary, output_path, 'test')
+        
+        # Print best model summary
+        if best_model_info:
+            print("\n🏆 Best Model (Selected by Test AUPRC and MCC):")
+            print("-" * 70)
+            print(f"   Length: {best_length}")
+            print(f"   Test AUPRC: {best_auprc:.4f}")
+            print(f"   Test MCC: {best_mcc:.4f}")
+            test_metrics = best_model_info.get('test_metrics', {})
+            if test_metrics:
+                print(f"   Test Metrics:")
+                print(f"      Loss: {test_metrics.get('loss', 'N/A'):.4f}" if test_metrics.get('loss') is not None else "      Loss: N/A")
+                print(f"      Accuracy: {test_metrics.get('accuracy', 'N/A'):.4f}" if test_metrics.get('accuracy') is not None else "      Accuracy: N/A")
+                print(f"      Precision: {test_metrics.get('precision', 'N/A'):.4f}" if test_metrics.get('precision') is not None else "      Precision: N/A")
+                print(f"      Recall: {test_metrics.get('recall', 'N/A'):.4f}" if test_metrics.get('recall') is not None else "      Recall: N/A")
+                print(f"      F1: {test_metrics.get('f1', 'N/A'):.4f}" if test_metrics.get('f1') is not None else "      F1: N/A")
+                print(f"      AUROC: {test_metrics.get('auroc', 'N/A'):.4f}" if test_metrics.get('auroc') is not None else "      AUROC: N/A")
+                print(f"      AUPRC: {test_metrics.get('auprc', 'N/A'):.4f}" if test_metrics.get('auprc') is not None else "      AUPRC: N/A")
+                print(f"      MCC: {test_metrics.get('mcc', 'N/A'):.4f}" if test_metrics.get('mcc') is not None else "      MCC: N/A")
+        
+        # Print summary statistics
+        print("\n📊 Summary Statistics - Best Validation Metrics:")
+        print("-" * 100)
+        header = f"{'Length':<8} {'Loss':<10} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1':<10} {'AUROC':<10} {'AUPRC':<10} {'MCC':<10}"
+        print(header)
+        print("-" * 100)
+        
+        for seq_len in sorted(summary['length_groups'].keys()):
+            group = summary['length_groups'][seq_len]
+            val_metrics = group.get('best_validation_metrics', {})
+            
+            if val_metrics:
+                loss = val_metrics.get('loss')
+                acc = val_metrics.get('accuracy')
+                prec = val_metrics.get('precision')
+                rec = val_metrics.get('recall')
+                f1 = val_metrics.get('f1')
+                auroc = val_metrics.get('auroc')
+                auprc = val_metrics.get('auprc')
+                mcc = val_metrics.get('mcc')
+                
+                loss_str = f"{loss:.4f}" if loss is not None else "N/A"
+                acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+                prec_str = f"{prec:.4f}" if prec is not None else "N/A"
+                rec_str = f"{rec:.4f}" if rec is not None else "N/A"
+                f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
+                auroc_str = f"{auroc:.4f}" if auroc is not None else "N/A"
+                auprc_str = f"{auprc:.4f}" if auprc is not None else "N/A"
+                mcc_str = f"{mcc:.4f}" if mcc is not None else "N/A"
+                
+                print(f"{seq_len:<8} {loss_str:<10} {acc_str:<12} {prec_str:<12} {rec_str:<12} {f1_str:<10} {auroc_str:<10} {auprc_str:<10} {mcc_str:<10}")
+            else:
+                print(f"{seq_len:<8} {'N/A':<10} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
+        
+        print("\n📊 Summary Statistics - Test Metrics:")
+        print("-" * 100)
+        print(header)
+        print("-" * 100)
+        
+        for seq_len in sorted(summary['length_groups'].keys()):
+            group = summary['length_groups'][seq_len]
+            test_metrics = group.get('test_metrics', {})
+            
+            if test_metrics:
+                loss = test_metrics.get('loss')
+                acc = test_metrics.get('accuracy')
+                prec = test_metrics.get('precision')
+                rec = test_metrics.get('recall')
+                f1 = test_metrics.get('f1')
+                auroc = test_metrics.get('auroc')
+                auprc = test_metrics.get('auprc')
+                mcc = test_metrics.get('mcc')
+                
+                loss_str = f"{loss:.4f}" if loss is not None else "N/A"
+                acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+                prec_str = f"{prec:.4f}" if prec is not None else "N/A"
+                rec_str = f"{rec:.4f}" if rec is not None else "N/A"
+                f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
+                auroc_str = f"{auroc:.4f}" if auroc is not None else "N/A"
+                auprc_str = f"{auprc:.4f}" if auprc is not None else "N/A"
+                mcc_str = f"{mcc:.4f}" if mcc is not None else "N/A"
+                
+                print(f"{seq_len:<8} {loss_str:<10} {acc_str:<12} {prec_str:<12} {rec_str:<12} {f1_str:<10} {auroc_str:<10} {auprc_str:<10} {mcc_str:<10}")
+            else:
+                print(f"{seq_len:<8} {'N/A':<10} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
+        
+        print("\n" + "="*70)
+        print("🎉 All length group models trained!")
+        print("="*70)
+        
+        return
+    
+    # Original training logic (single model for all lengths)
     # Create dataset and dataloader for training
     train_dataset = EmbeddingDataset(train_embeddings, train_labels, train_sequences)
+    # Use LengthGroupedBatchSampler to ensure all sequences in a batch have the same length
+    # This is required for GNNTrans to correctly calculate center node positions
+    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size=args.batch_size, shuffle=True)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=0
     )
@@ -545,10 +1193,11 @@ def main():
     valid_loader = None
     if valid_embeddings is not None and valid_labels is not None:
         valid_dataset = EmbeddingDataset(valid_embeddings, valid_labels, valid_sequences)
+        # Use LengthGroupedBatchSampler for validation as well
+        valid_sampler = LengthGroupedBatchSampler(valid_dataset, batch_size=args.batch_size, shuffle=False)
         valid_loader = DataLoader(
             valid_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
+            batch_sampler=valid_sampler,
             collate_fn=collate_fn,
             num_workers=0
         )
@@ -557,10 +1206,11 @@ def main():
     test_loader = None
     if test_embeddings is not None and test_labels is not None:
         test_dataset = EmbeddingDataset(test_embeddings, test_labels, test_sequences)
+        # Use LengthGroupedBatchSampler for test as well
+        test_sampler = LengthGroupedBatchSampler(test_dataset, batch_size=args.batch_size, shuffle=False)
         test_loader = DataLoader(
             test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
+            batch_sampler=test_sampler,
             collate_fn=collate_fn,
             num_workers=0
         )

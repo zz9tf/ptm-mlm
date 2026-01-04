@@ -22,7 +22,7 @@ from utils.mask import Masker
 from utils.scheduler import Esm2LRScheduler
 from utils.config import load_config
 from utils.checkpoint import load_ckpt_from_output_dir
-from utils.esm_utils import make_esm_input_ids, compute_esm_embedding, load_esm_model, get_esm_embed_dim
+from utils.esm_utils import make_esm_input_ids, compute_esm_embedding
 from utils.loss import mlm_loss
 from utils.embedding_loader import EmbeddingLoader
 from models.mamba.lm import MambaLMHeadModel
@@ -235,26 +235,28 @@ def train(
             # Get ESM model name from config (default to "esm2_15b" for backward compatibility)
             esm_model_name = train_args.get("esm_model", "esm2_15b")
             
-            # Get representation layer from config
-            repr_layer_override = train_args.get("repr_layer", None)
+            if accelerator.is_local_main_process:
+                accelerator.print(f"🔄 Loading ESM model: {esm_model_name}")
             
-            # Load ESM model using utility function
-            esm_model, alphabet, batch_converter, repr_layer, model_type, _ = load_esm_model(
-                esm_model_name, accelerator, repr_layer_override=repr_layer_override
-            )
-            
-            # Prepare ESM model with accelerator for distributed training support
-            if model_type != "esmc":
-                esm_model = accelerator.prepare(esm_model)
+            # Load ESM model based on configuration
+            if esm_model_name == "esm2_650m":
+                # Load ESM2 650M model
+                esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            elif esm_model_name == "esm2_15b":
+                # Load ESM2 15B model
+                esm_model, alphabet = esm.pretrained.esm2_t48_15B_UR50D()
             else:
-                # ESM C models use .to() method instead of accelerator.prepare()
-                if hasattr(accelerator, 'device'):
-                    esm_model = esm_model.to(accelerator.device)
-                elif hasattr(accelerator, 'local_process_index'):
-                    # Fallback: try to get device from accelerator
-                    device = torch.device(f"cuda:{accelerator.local_process_index}" if torch.cuda.is_available() else "cpu")
-                    esm_model = esm_model.to(device)
+                # Default to ESM2 15B if unknown model name
+                if accelerator.is_local_main_process:
+                    accelerator.print(f"⚠️  Warning: Unknown ESM model '{esm_model_name}', defaulting to 'esm2_15b'")
+                esm_model, alphabet = esm.pretrained.esm2_t48_15B_UR50D()
             
+            batch_converter = alphabet.get_batch_converter()
+            esm_model.eval()
+            for param in esm_model.parameters():
+                param.requires_grad = False
+            # Prepare ESM model with accelerator for distributed training support
+            esm_model = accelerator.prepare(esm_model)
     else:
         esm_model = None
         batch_converter = None
@@ -879,24 +881,6 @@ def main():
                 split_summary[split_name] = count
             accelerator.print(f"   Split summary: {split_summary}")
 
-    # Auto-detect esm_embed_dim from ESM model name (must be done before model initialization)
-    if train_args.get("use_esm", False):
-        # Get dimension from model name (works for both precomputed and on-the-fly)
-        esm_model_name = train_args.get("esm_model", "esm2_15b")
-        repr_layer_override = train_args.get("repr_layer", None)
-        try:
-            model_config["esm_embed_dim"] = get_esm_embed_dim(esm_model_name, repr_layer_override)
-            if accelerator.is_local_main_process:
-                accelerator.print(f"✅ Auto-detected ESM embedding dimension: {model_config['esm_embed_dim']} (from {esm_model_name})")
-        except Exception as e:
-            if accelerator.is_local_main_process:
-                accelerator.print(f"❌ Failed to auto-detect ESM embedding dimension: {e}")
-                accelerator.print(f"⚠️  Falling back to default: 5120 (esm2_15b)")
-            model_config["esm_embed_dim"] = 5120  # Default fallback
-    else:
-        # ESM not used, set to None
-        model_config["esm_embed_dim"] = None
-    
     # Handle checkpoint loading from output directory
     if resume_from_output:
         # Resume from output directory (always loads from last.ckpt)

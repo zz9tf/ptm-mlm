@@ -324,6 +324,25 @@ def main():
     assert len(all_test_embeddings) == len(all_test_labels) == len(all_test_sequences), \
         f"Final test mismatch: embeddings={len(all_test_embeddings)}, labels={len(all_test_labels)}, sequences={len(all_test_sequences)}"
     
+    # Print sequence length distribution for reference
+    print("\n📊 Sequence length distribution:")
+    train_lengths = [emb.shape[0] for emb in all_train_embeddings]
+    valid_lengths = [emb.shape[0] for emb in all_valid_embeddings] if len(all_valid_embeddings) > 0 else []
+    test_lengths = [emb.shape[0] for emb in all_test_embeddings] if len(all_test_embeddings) > 0 else []
+    
+    from collections import Counter
+    train_length_dist = Counter(train_lengths)
+    valid_length_dist = Counter(valid_lengths) if valid_lengths else {}
+    test_length_dist = Counter(test_lengths) if test_lengths else {}
+    
+    all_unique_lengths = set(train_lengths + valid_lengths + test_lengths)
+    print(f"   Found {len(all_unique_lengths)} different sequence lengths: {sorted(all_unique_lengths)}")
+    print(f"   Train length distribution: {dict(sorted(train_length_dist.items()))}")
+    if valid_length_dist:
+        print(f"   Valid length distribution: {dict(sorted(valid_length_dist.items()))}")
+    if test_length_dist:
+        print(f"   Test length distribution: {dict(sorted(test_length_dist.items()))}")
+    
     # Save training data (in embeddings subdirectory)
     train_emb_path = os.path.join(embeddings_dir, "train_embeddings.pt")
     train_labels_path = os.path.join(embeddings_dir, "train_labels.pt")

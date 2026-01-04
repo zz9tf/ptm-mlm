@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 import sys
+import yaml
 
 # Add current directory to path for local imports
 current_dir = Path(__file__).parent

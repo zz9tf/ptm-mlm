@@ -24,6 +24,8 @@ dataset:
 training:
   resume_from_output: null  # Path to output directory to resume training from (e.g., "outputs/ptm-mamba-2025-12-22-15-01-34"). Always loads from last.ckpt
   use_esm: false # or true
+  esm_model: "esm2_15b"  # ESM model to use: "esm2_650m" (ESM2 650M), "esm2_15b" (ESM2 15B), "esm3_7b" (ESM3 7B), or "esmc_300m" (ESM C 300M). Only used when use_esm is true
+  repr_layer: null  # Representation layer index to extract embeddings from. If null, uses model default (last layer). Only used for embedding generation.
   # Use pre-computed embeddings (set to true and provide embeddings_dir to use pre-generated embeddings)
   use_precomputed_embeddings: false
   embeddings_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/embeddings"  # Path to directory containing train_embeddings.json, val_embeddings.json, test_embeddings.json
@@ -46,6 +48,5 @@ model:
   residual_in_fp32: true
   fused_add_norm: true
   pad_vocab_size_multiple: 8
-  esm_embed_dim: 5120  # ESM2-15B (esm2_t48_15B_UR50D) embedding dimension
   ssm_cfg: {}
 

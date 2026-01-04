@@ -21,7 +21,8 @@ class ModelInference:
     This class is shared across all downstream tasks.
     """
     
-    def __init__(self, checkpoint_path: str, device: str = None, max_sequence_length: int = None, use_esm: bool = True):
+    def __init__(self, checkpoint_path: str, device: str = None, max_sequence_length: int = None, 
+                 use_esm: bool = True, esm2_model_name: str = "facebook/esm2_t48_15B_UR50D"):
         """
         Initialize the inference model.
         
@@ -30,8 +31,11 @@ class ModelInference:
         @param max_sequence_length: Maximum sequence length for tokenization. 
                                    If None, sequences will not be truncated (may cause memory issues).
                                    Default: 512 (matching training config)
-        @param use_esm: If True, load ESM2-15B and use Mamba+ESM2 combination (matching training).
+        @param use_esm: If True, load ESM2 and use Mamba+ESM2 combination (matching training).
                        If False, use Mamba-only mode.
+        @param esm2_model_name: ESM2 model name. Options:
+                               - "facebook/esm2_t48_15B_UR50D" (default, 15B parameters)
+                               - "facebook/esm2_t33_650M_UR50D" (650M parameters)
         """
         # Determine device
         if device is None:
@@ -54,20 +58,50 @@ class ModelInference:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # Load ESM2-15B if use_esm is True (matching training setup)
+        # Auto-detect ESM2 model type from checkpoint if use_esm is True
+        # Check esm_head input dimension to determine which ESM2 model was used during training
+        detected_esm_model_name = None
+        if use_esm and hasattr(self.model, 'esm_head') and self.model.esm_head is not None:
+            esm_embed_dim = self.model.esm_head.in_features
+            if esm_embed_dim == 1280:
+                detected_esm_model_name = "facebook/esm2_t33_650M_UR50D"
+            elif esm_embed_dim == 5120:
+                detected_esm_model_name = "facebook/esm2_t48_15B_UR50D"
+            else:
+                print(f"⚠️  Warning: Unknown ESM embedding dimension {esm_embed_dim} in checkpoint.")
+                print(f"   Expected 1280 (ESM2-650M) or 5120 (ESM2-15B).")
+        
+        # Use detected model name if available, otherwise use provided one
+        if detected_esm_model_name:
+            if esm2_model_name != detected_esm_model_name:
+                print(f"⚠️  Warning: Checkpoint was trained with {detected_esm_model_name}, but {esm2_model_name} was specified.")
+                print(f"   Auto-switching to {detected_esm_model_name} to match checkpoint configuration.")
+            esm2_model_name = detected_esm_model_name
+        
+        # Load ESM2 if use_esm is True (matching training setup)
         self.use_esm = use_esm
         self.esm_model = None
         self.batch_converter = None
+        self.esm2_model_name = esm2_model_name
+        self.esm_repr_layer = 33  # Both ESM2-15B and ESM2-650M use layer 33
         
         if use_esm:
-            print(f"📦 Loading ESM2-15B model...")
-            self.esm_model, alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+            if esm2_model_name == "facebook/esm2_t48_15B_UR50D":
+                print(f"📦 Loading ESM2-15B model...")
+                self.esm_model, alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+            elif esm2_model_name == "facebook/esm2_t33_650M_UR50D":
+                print(f"📦 Loading ESM2-650M model...")
+                self.esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+            else:
+                raise ValueError(f"Unknown ESM2 model name: {esm2_model_name}. "
+                               f"Supported: 'facebook/esm2_t48_15B_UR50D' or 'facebook/esm2_t33_650M_UR50D'")
+            
             self.batch_converter = alphabet.get_batch_converter()
             self.esm_model = self.esm_model.to(self.device)
             self.esm_model.eval()
             for param in self.esm_model.parameters():
                 param.requires_grad = False
-            print(f"✅ ESM2-15B loaded successfully!")
+            print(f"✅ {esm2_model_name} loaded successfully!")
         else:
             print(f"ℹ️  Using Mamba-only mode (no ESM2)")
         
@@ -83,7 +117,8 @@ class ModelInference:
         
         print(f"✅ Mamba model loaded successfully! Hidden size: {self.hidden_size}")
         print(f"📏 Max sequence length: {self.max_sequence_length}")
-        print(f"🔧 Mode: {'Mamba+ESM2-15B' if use_esm else 'Mamba-only'}")
+        mode_str = f"Mamba+{esm2_model_name}" if use_esm else "Mamba-only"
+        print(f"🔧 Mode: {mode_str}")
     
     @torch.no_grad()
     def generate_embeddings(self, sequences: list, batch_size: int = 32, return_pooled: bool = False, max_sequence_length: int = None):
@@ -130,8 +165,8 @@ class ModelInference:
                 ]
                 batch_labels, batch_strs, batch_tokens = self.batch_converter(inputs)
                 batch_tokens = batch_tokens[..., 1:-1].to(self.device)  # remove <cls> and <eos>
-                out = self.esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
-                esm_embedding = out["representations"][33]  # [batch_size, seq_len, esm_hidden_size]
+                out = self.esm_model(batch_tokens, repr_layers=[self.esm_repr_layer], return_contacts=False)
+                esm_embedding = out["representations"][self.esm_repr_layer]  # [batch_size, seq_len, esm_hidden_size]
                 
                 # Align ESM embedding dimensions with input_ids (handle padding)
                 # This matches the alignment logic in train.py
@@ -141,9 +176,11 @@ class ModelInference:
                 elif esm_embedding.shape[1] > input_ids.shape[1]:
                     esm_embedding = esm_embedding[:, :input_ids.shape[1]]
             
-            # Generate embeddings using model backbone with ESM embeddings (matching training)
-            # The model will fuse Mamba and ESM embeddings internally
-            hidden_states = self.model.backbone(input_ids, embedding=esm_embedding)
+            # Generate embeddings using model with ESM embeddings (matching training)
+            # The model will project ESM embeddings through esm_head first, then fuse with Mamba embeddings
+            # Note: Use model() instead of model.backbone() to ensure esm_head projection is applied
+            model_outputs = self.model(input_ids, embedding=esm_embedding)
+            hidden_states = model_outputs.hidden_states
             
             if return_pooled:
                 # Mean pooling over sequence length (excluding padding)
@@ -278,8 +315,8 @@ class ModelInference:
             ]
             batch_labels, batch_strs, batch_tokens = self.batch_converter(inputs)
             batch_tokens = batch_tokens[..., 1:-1].to(self.device)  # remove <cls> and <eos>
-            out = self.esm_model(batch_tokens, repr_layers=[33], return_contacts=False)
-            esm_embedding = out["representations"][33]  # [batch_size, seq_len, esm_hidden_size]
+            out = self.esm_model(batch_tokens, repr_layers=[self.esm_repr_layer], return_contacts=False)
+            esm_embedding = out["representations"][self.esm_repr_layer]  # [batch_size, seq_len, esm_hidden_size]
             
             # Align ESM embedding dimensions with input_ids (handle padding)
             # This matches the alignment logic in train.py
@@ -289,9 +326,11 @@ class ModelInference:
             elif esm_embedding.shape[1] > input_ids.shape[1]:
                 esm_embedding = esm_embedding[:, :input_ids.shape[1]]
         
-        # Generate embeddings using model backbone with ESM embeddings (matching training)
-        # The model will fuse Mamba and ESM embeddings internally
-        hidden_states = self.model.backbone(input_ids, embedding=esm_embedding)
+        # Generate embeddings using model with ESM embeddings (matching training)
+        # The model will project ESM embeddings through esm_head first, then fuse with Mamba embeddings
+        # Note: Use model() instead of model.backbone() to ensure esm_head projection is applied
+        model_outputs = self.model(input_ids, embedding=esm_embedding)
+        hidden_states = model_outputs.hidden_states
         
         # Extract per-position embeddings (remove CLS and EOS tokens)
         # 🔧 Fix: Simply remove CLS (position 0) and EOS, get embeddings for all sequence positions

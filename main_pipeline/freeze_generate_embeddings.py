@@ -21,9 +21,9 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
 from getters.tokenizer import PTMTokenizer
-from getters.freeze_ptm_dataset import get_ptm_dataset
+from getters.ptm_dataset import get_ptm_dataset
 from utils.config import load_config
-from utils.esm_utils import make_esm_input_ids, load_esm_model
+from utils.esm_utils import make_esm_input_ids
 
 
 class EmbeddingBuffer:
@@ -360,11 +360,6 @@ def append_chunk_to_h5(chunk_data_by_ac_id, chunk_path, embed_dim, max_seq_len):
                             # Resize and append embeddings
                             existing_embeddings.resize((new_size,))
                             for i, emb in enumerate(data['embeddings']):
-                                if emb.shape[0] > max_seq_len:
-                                    raise ValueError(
-                                        f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
-                                        f"for AC_ID {ac_id}, window {i}"
-                                    )
                                 # Pad embedding to max_seq_len
                                 padded_emb = np.zeros((max_seq_len, embed_dim), dtype=np.float32)
                                 padded_emb[:emb.shape[0], :] = emb
@@ -393,11 +388,6 @@ def append_chunk_to_h5(chunk_data_by_ac_id, chunk_path, embed_dim, max_seq_len):
                             num_windows = len(data['embeddings'])
                             embedding_data = np.zeros((num_windows, max_seq_len, embed_dim), dtype=np.float32)
                             for i, emb in enumerate(data['embeddings']):
-                                if emb.shape[0] > max_seq_len:
-                                    raise ValueError(
-                                        f"Embedding length {emb.shape[0]} exceeds max_seq_len {max_seq_len} "
-                                        f"for AC_ID {ac_id}, window {i}"
-                                    )
                                 embedding_data[i, :emb.shape[0], :] = emb
                             
                             group.create_dataset('embedding_seq', data=embedding_data, 
@@ -516,6 +506,79 @@ def merge_chunk_files(chunk_files, output_path, accelerator):
             pass
 
 
+def load_esm_model(model_name, accelerator):
+    """
+    Load ESM model (ESM2 650M, ESM2 15B, or ESM3 7B) based on model name.
+    
+    @param model_name: Model name ('esm2_650m', 'esm2_15b', or 'esm3_7b')
+    @param accelerator: Accelerator instance for logging
+    @return: Tuple of (esm_model, alphabet, batch_converter, repr_layer, model_type)
+    """
+    if accelerator.is_local_main_process:
+        accelerator.print(f"🔄 Loading {model_name} model...")
+    
+    if model_name == "esm2_650m":
+        # Load ESM2 650M model
+        esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        repr_layer = 33  # ESM2 650M has 33 layers, use last layer (index 33)
+        model_type = "esm2"
+    elif model_name == "esm2_15b":
+        # Load ESM2 15B model
+        esm_model, alphabet = esm.pretrained.esm2_t48_15B_UR50D()
+        repr_layer = 33  # ESM2 15B uses layer 33 for embeddings
+        model_type = "esm2"
+    elif model_name == "esm3_7b":
+        # Load ESM3 7B model
+        # Try different possible model identifiers for ESM3 7B
+        try:
+            # Try esm3-sm-open-v1 (7B model)
+            esm_model, alphabet = esm.pretrained.load_model_and_alphabet("esm3-sm-open-v1")
+            repr_layer = None  # Will use the last layer
+            model_type = "esm3"
+        except Exception as e1:
+            try:
+                # Try esm3-medium-2024-08 (alternative identifier)
+                esm_model, alphabet = esm.pretrained.load_model_and_alphabet("esm3-medium-2024-08")
+                repr_layer = None
+                model_type = "esm3"
+            except Exception as e2:
+                if accelerator.is_local_main_process:
+                    accelerator.print(f"❌ Failed to load ESM3 7B model")
+                    accelerator.print(f"   Error 1 (esm3-sm-open-v1): {e1}")
+                    accelerator.print(f"   Error 2 (esm3-medium-2024-08): {e2}")
+                raise RuntimeError(f"Could not load ESM3 7B model. Please check if the model is available.")
+    else:
+        raise ValueError(f"Unknown model name: {model_name}. Supported: 'esm2_650m', 'esm2_15b', 'esm3_7b'")
+    
+    esm_model.eval()
+    for param in esm_model.parameters():
+        param.requires_grad = False
+    
+    batch_converter = alphabet.get_batch_converter()
+    
+    # Determine the actual representation layer for ESM3
+    if model_type == "esm3" and repr_layer is None:
+        # ESM3 typically uses the last layer, get the number of layers
+        try:
+            # Try to get layer count from model structure
+            if hasattr(esm_model, "num_layers"):
+                repr_layer = esm_model.num_layers - 1
+            elif hasattr(esm_model, "encoder") and hasattr(esm_model.encoder, "num_layers"):
+                repr_layer = esm_model.encoder.num_layers - 1
+            elif hasattr(esm_model, "layers"):
+                repr_layer = len(esm_model.layers) - 1
+            else:
+                # Default: use -1 to indicate last layer (will be determined at runtime)
+                repr_layer = -1
+        except Exception:
+            # If we can't determine, use -1 to indicate last layer
+            repr_layer = -1
+    
+    if accelerator.is_local_main_process:
+        accelerator.print(f"✅ Loaded {model_name} model")
+        accelerator.print(f"   Using representation layer: {repr_layer}")
+    
+    return esm_model, alphabet, batch_converter, repr_layer, model_type
 
 
 def extract_windows_for_sequence(
@@ -531,53 +594,58 @@ def extract_windows_for_sequence(
     """
     Extract all windows for a single sequence.
     
-    IMPORTANT: All ranges are based on character positions in the original sequence,
-    not token positions. This ensures consistency with the new dataset loading method.
-    
     @param ac_id: AC_ID string
-    @param seq_for_esm: Sequence to use for ESM input (original sequence if use_original_seq=True)
-    @param ori_seq_full: Full original sequence (without PTM annotations)
-    @param ptm_seq_full: Full PTM sequence (with PTM annotations)
+    @param seq_for_esm: Sequence to use for ESM input
+    @param ori_seq_full: Full original sequence
+    @param ptm_seq_full: Full PTM sequence
     @param tokenizer: Tokenizer instance
-    @param max_sequence_length: Maximum sequence length (in characters, not tokens)
+    @param max_sequence_length: Maximum sequence length
     @param use_original_seq: Whether to use original sequence for ESM
     @param device: Device for tensor operations
-    @return: List of window info dictionaries with:
-        - 'char_start', 'char_end': Character positions in original sequence (for range)
-        - 'window_seq': Sequence for ESM input
-        - 'ori_seq_window': Original sequence window
-        - 'ptm_seq_window': PTM sequence window
+    @return: List of window info dictionaries
     """
     windows = []
     
-    # Always compute windows based on character positions in original sequence
-    # This ensures range consistency with the new dataset loading method
-    ori_seq_len = len(ori_seq_full)
-    window_ranges = compute_extraction_windows(ori_seq_len, max_sequence_length)
+    if use_original_seq:
+        # For original sequences: work directly with string length
+        seq_len = len(seq_for_esm)
+        window_ranges = compute_extraction_windows(seq_len, max_sequence_length)
+    else:
+        # For PTM sequences: tokenize first to get correct length
+        tokenized = tokenizer(
+            [seq_for_esm],
+            add_special_tokens=True,
+            max_sequence_length=None,
+        )
+        input_ids = torch.tensor(tokenized[0], device=device)
+        seq_len = len(input_ids)
+        window_ranges = compute_extraction_windows(seq_len, max_sequence_length)
     
-    for win_idx, (char_start, char_end) in enumerate(window_ranges):
-        # Extract windows from original and PTM sequences based on character positions
-        ori_seq_window = ori_seq_full[char_start:char_end]
-        ptm_seq_window = ptm_seq_full[char_start:char_end] if len(ptm_seq_full) >= char_end else ptm_seq_full[char_start:]
-        
-        # Prepare sequence for ESM input
+    for win_idx, (window_start, window_end) in enumerate(window_ranges):
         if use_original_seq:
-            # Use original sequence directly for ESM
-            window_seq = ori_seq_window
+            # Extract window directly from original sequence string
+            window_seq = seq_for_esm[window_start:window_end]
             window_len = len(window_seq)
+            
+            # Extract corresponding window from ori_seq and ptm_seq
+            ori_seq_window = ori_seq_full[window_start:window_end]
+            ptm_seq_window = ptm_seq_full[window_start:window_end] if len(ptm_seq_full) >= window_end else ptm_seq_full[window_start:]
         else:
-            # Use PTM sequence for ESM (will be processed to mask PTM tokens)
-            # Tokenize the PTM sequence window to get token length
-            tokenized = tokenizer(
-                [ptm_seq_window],
-                add_special_tokens=True,
-                max_sequence_length=None,
+            # Extract window from tokenized sequence
+            window_ids = input_ids[window_start:window_end]
+            window_len = window_end - window_start
+            
+            # Map tokenized window indices back to sequence string positions
+            char_start, char_end = map_token_indices_to_char_positions(
+                ptm_seq_full, tokenizer, window_start, window_end, seq_len
             )
-            input_ids = torch.tensor(tokenized[0], device=device)
-            window_len = len(input_ids)
+            
+            # Extract sequences for this window
+            ptm_seq_window = ptm_seq_full[char_start:char_end]
+            ori_seq_window = ori_seq_full[char_start:char_end] if len(ori_seq_full) >= char_end else ori_seq_full[char_start:]
             
             # Prepare ESM input: replace PTM tokens with mask
-            window_ids = input_ids.unsqueeze(0)
+            window_ids = window_ids.unsqueeze(0)
             esm_input_ids = make_esm_input_ids(window_ids, tokenizer)
             decoded_str = tokenizer.decode(esm_input_ids[0].detach().cpu().tolist())
             decoded_str_clean = decoded_str.replace("<cls>", "").replace("<eos>", "")
@@ -586,14 +654,12 @@ def extract_windows_for_sequence(
         windows.append({
             'ac_id': ac_id,
             'window_idx': win_idx,
-            'char_start': char_start,  # Character position in original sequence
-            'char_end': char_end,      # Character position in original sequence
-            'window_start': char_start,  # Alias for compatibility
-            'window_end': char_end,      # Alias for compatibility
-            'window_len': window_len,    # Length of window_seq (for ESM)
-            'window_seq': window_seq,   # Sequence for ESM input
-            'ori_seq_window': ori_seq_window,  # Original sequence window
-            'ptm_seq_window': ptm_seq_window,  # PTM sequence window
+            'window_start': window_start,
+            'window_end': window_end,
+            'window_len': window_len,
+            'window_seq': window_seq,
+            'ori_seq_window': ori_seq_window,
+            'ptm_seq_window': ptm_seq_window,
         })
     
     return windows
@@ -606,189 +672,49 @@ def process_window_batch(
     repr_layer: int,
     model_type: str,
     device: torch.device,
-    accelerator: Accelerator,
-    embed_dim: Optional[int] = None
+    accelerator: Accelerator
 ) -> List[np.ndarray]:
     """
     Process a batch of windows and extract embeddings.
     
     @param window_batch: List of window info dictionaries
     @param esm_model: ESM model
-    @param batch_converter: ESM batch converter (None for ESM C)
+    @param batch_converter: ESM batch converter
     @param repr_layer: Representation layer index
-    @param model_type: Model type ('esm2', 'esm3', or 'esmc')
+    @param model_type: Model type ('esm2' or 'esm3')
     @param device: Device for computation
     @param accelerator: Accelerator instance
-    @param embed_dim: Expected embedding dimension (for fallback when creating zero embeddings)
     @return: List of embeddings (numpy arrays)
     """
-    if model_type == "esmc":
-        # ESM C uses different API
-        # Note: ESM C API may not support batch processing or layer specification
-        # We process sequences one by one
-        from esm.sdk.api import ESMProtein, LogitsConfig
-        
-        embeddings = []
-        for window_info in window_batch:
-            sequence = window_info['window_seq']
-            try:
-                protein = ESMProtein(sequence=sequence)
-                protein_tensor = esm_model.encode(protein)
-                
-                # Handle potential errors from encode
-                if hasattr(protein_tensor, 'error'):
-                    if accelerator.is_local_main_process:
-                        accelerator.print(f"⚠️  Error encoding sequence: {protein_tensor.error}")
-                    # Create zero embedding as fallback
-                    window_len = window_info['window_len']
-                    # Get embed_dim from first successful embedding, or use provided embed_dim
-                    fallback_embed_dim = embeddings[0].shape[1] if embeddings else (embed_dim if embed_dim is not None else None)
-                    if fallback_embed_dim is None:
-                        raise RuntimeError("Cannot determine embedding dimension: no successful embeddings and embed_dim not provided")
-                    embeddings.append(np.zeros((window_len, fallback_embed_dim), dtype=np.float32))
-                    continue
-                
-                # Get embeddings using logits API
-                # ESM C returns hidden_states with shape [num_layers, batch_size, seq_len, embed_dim]
-                # We can extract specific layer from hidden_states
-                # If repr_layer is specified, use hidden_states; otherwise use embeddings (last layer)
-                
-                if repr_layer is not None and repr_layer >= 0:
-                    # Extract specific layer from hidden_states
-                    logits_config = LogitsConfig(sequence=True, return_hidden_states=True)
-                    logits_output = esm_model.logits(protein_tensor, logits_config)
-                    
-                    # hidden_states shape: [num_layers, batch_size, seq_len, embed_dim]
-                    hidden_states = logits_output.hidden_states
-                    
-                    # Clamp layer index to valid range
-                    num_layers = hidden_states.shape[0]
-                    layer_idx = min(repr_layer, num_layers - 1)
-                    
-                    # Extract specific layer: [batch_size, seq_len, embed_dim]
-                    window_emb = hidden_states[layer_idx]
-                    
-                    # Remove batch dimension: [1, seq_len, embed_dim] -> [seq_len, embed_dim]
-                    if window_emb.dim() == 3 and window_emb.shape[0] == 1:
-                        window_emb = window_emb.squeeze(0)
-                    
-                    window_emb = window_emb.cpu().numpy()
-                else:
-                    # Use default embeddings (last layer)
-                    logits_config = LogitsConfig(sequence=True, return_embeddings=True)
-                    logits_output = esm_model.logits(protein_tensor, logits_config)
-                    
-                    # Extract embeddings (last layer)
-                    # Note: ESM C returns embeddings with shape [batch_size, seq_len, embed_dim]
-                    window_emb = logits_output.embeddings
-                    if isinstance(window_emb, torch.Tensor):
-                        # Remove batch dimension if present: [1, seq_len, embed_dim] -> [seq_len, embed_dim]
-                        if window_emb.dim() == 3 and window_emb.shape[0] == 1:
-                            window_emb = window_emb.squeeze(0)
-                        window_emb = window_emb.cpu().numpy()
-                    else:
-                        # If it's already a numpy array or other type
-                        if hasattr(window_emb, 'detach'):
-                            window_emb = window_emb.detach().cpu().numpy()
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                        elif hasattr(window_emb, 'numpy'):
-                            window_emb = window_emb.numpy()
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                        elif hasattr(window_emb, '__array__'):
-                            # Convert to numpy if it has __array__ method
-                            window_emb = np.array(window_emb)
-                            if window_emb.ndim == 3 and window_emb.shape[0] == 1:
-                                window_emb = window_emb.squeeze(0)
-                
-                # Verify embedding shape
-                if len(window_emb.shape) != 2:
-                    raise ValueError(f"Unexpected embedding shape: {window_emb.shape}, expected (seq_len, embed_dim)")
-                
-                # Verify embedding length matches sequence length
-                ori_seq_window = window_info['ori_seq_window']
-                actual_seq_len = len(ori_seq_window)
-                embedding_len = window_emb.shape[0]
-                
-                if embedding_len != actual_seq_len:
-                    raise ValueError(
-                        f"Embedding length mismatch: expected {actual_seq_len} (sequence length), "
-                        f"got {embedding_len} (embedding length) for sequence '{sequence[:50]}...'"
-                    )
-                
-                embeddings.append(window_emb)
-            except Exception as e:
-                if accelerator.is_local_main_process:
-                    accelerator.print(f"⚠️  Error processing sequence '{sequence[:50]}...': {e}")
-                    import traceback
-                    traceback.print_exc()
-                # Create zero embedding as fallback
-                window_len = window_info['window_len']
-                # Try to get embed_dim from first successful embedding, or use provided embed_dim
-                if embeddings:
-                    fallback_embed_dim = embeddings[0].shape[1]
-                elif embed_dim is not None:
-                    fallback_embed_dim = embed_dim
-                else:
-                    # This should not happen if embed_dim is properly set from model
-                    raise RuntimeError("Cannot determine embedding dimension: no successful embeddings and embed_dim not provided")
-                embeddings.append(np.zeros((window_len, fallback_embed_dim), dtype=np.float32))
-        
-        return embeddings
-    else:
-        # ESM2/ESM3 models
-        # Prepare ESM inputs
-        esm_inputs = [(i, w['window_seq']) for i, w in enumerate(window_batch)]
-        
-        # Compute ESM embeddings
-        batch_labels, batch_strs, batch_tokens = batch_converter(esm_inputs)
-        
-        # Handle token format differences and remove special tokens
-        # ESM2/ESM3 batch_converter adds <cls> at the beginning and <eos> at the end
-        # We need to remove these special tokens from both tokens and embeddings
-        num_special_tokens_start = 1  # <cls> at the beginning
-        num_special_tokens_end = 1    # <eos> at the end
-        
-        if model_type == "esm2":
-            # Remove <cls> and <eos> tokens: [<cls>, seq_tokens, <eos>] -> [seq_tokens]
-            batch_tokens = batch_tokens[..., num_special_tokens_start:-num_special_tokens_end].to(device)
-        elif model_type == "esm3":
-            batch_tokens = batch_tokens.to(device)
-            max_window_len = max(w['window_len'] for w in window_batch)
-            # Check if special tokens are present (length > expected)
-            if batch_tokens.shape[-1] > max_window_len + num_special_tokens_start + num_special_tokens_end:
-                batch_tokens = batch_tokens[..., num_special_tokens_start:-num_special_tokens_end]
-        
-        # Extract embeddings (these will have the same length as batch_tokens after removing special tokens)
-        batch_embeddings = extract_esm_embeddings(
-            esm_model, batch_tokens, repr_layer, model_type, accelerator
-        )
-        
-        # Convert to numpy and extract actual window lengths
-        # Note: batch_embeddings length should match batch_tokens length (after removing special tokens)
-        # We use the original sequence length (characters) to determine how many embeddings to keep
-        embeddings = []
-        for batch_idx, window_info in enumerate(window_batch):
-            # Get the actual sequence length (characters, not tokens)
-            # This is the length of the original sequence window, which should match the number of embeddings
-            ori_seq_window = window_info['ori_seq_window']
-            actual_seq_len = len(ori_seq_window)  # Character length of original sequence
-            
-            window_emb = batch_embeddings[batch_idx]  # Shape: (token_len, embed_dim)
-            
-            # Verify embedding length matches sequence length
-            embedding_len = window_emb.shape[0]
-            if embedding_len != actual_seq_len:
-                raise ValueError(
-                    f"Embedding length mismatch: expected {actual_seq_len} (sequence length), "
-                    f"got {embedding_len} (embedding length) for sequence '{window_info['window_seq'][:50]}...'"
-                )
-            
-            window_emb_actual = window_emb.cpu().numpy()
-            embeddings.append(window_emb_actual)
-        
-        return embeddings
+    # Prepare ESM inputs
+    esm_inputs = [(i, w['window_seq']) for i, w in enumerate(window_batch)]
+    
+    # Compute ESM embeddings
+    batch_labels, batch_strs, batch_tokens = batch_converter(esm_inputs)
+    
+    # Handle token format differences
+    if model_type == "esm2":
+        batch_tokens = batch_tokens[..., 1:-1].to(device)
+    elif model_type == "esm3":
+        batch_tokens = batch_tokens.to(device)
+        max_window_len = max(w['window_len'] for w in window_batch)
+        if batch_tokens.shape[-1] > max_window_len + 2:
+            batch_tokens = batch_tokens[..., 1:-1]
+    
+    # Extract embeddings
+    batch_embeddings = extract_esm_embeddings(
+        esm_model, batch_tokens, repr_layer, model_type, accelerator
+    )
+    
+    # Convert to numpy and extract actual window lengths
+    embeddings = []
+    for batch_idx, window_info in enumerate(window_batch):
+        window_len = window_info['window_len']
+        window_emb = batch_embeddings[batch_idx]
+        window_emb_actual = window_emb[:window_len].cpu().numpy()
+        embeddings.append(window_emb_actual)
+    
+    return embeddings
 
 
 def flush_buffer_to_disk(
@@ -889,12 +815,11 @@ def extract_esm_embeddings(esm_model, batch_tokens, repr_layer, model_type, acce
 
 def generate_embeddings_for_dataset(
     dataset,
-    tokenizer: PTMTokenizer,
+    tokenizer,
     esm_model,
     batch_converter,
     accelerator,
     output_dir,
-    embed_dim: int,
     batch_size=8,
     max_sequence_length=None,
     chunk_size_gb=100,
@@ -976,8 +901,9 @@ def generate_embeddings_for_dataset(
         # Initialize memory buffer
         # max_memory_gb: Safety threshold - flush if memory exceeds this (even if chunk_size not reached)
         max_memory_gb = chunk_size_gb * 1.1  # Allow buffer to grow up to 1.1x chunk_size for safety
-        buffer = EmbeddingBuffer(max_memory_gb=max_memory_gb, embed_dim=embed_dim)
+        buffer = EmbeddingBuffer(max_memory_gb=max_memory_gb)
         chunk_idx = 0
+        embed_dim = None
         max_seq_len = max_sequence_length  # Will be determined on first save if None
         
         # 🔧 Resume statistics
@@ -1062,7 +988,6 @@ def generate_embeddings_for_dataset(
                 continue
             
             # Step 2: Sort windows by length for efficient batching
-            # Sort by window_len (ESM input length) for efficient batching
             all_windows_sorted = sorted(all_windows, key=lambda w: w['window_len'])
             
             # Step 3: Process windows in batches and accumulate in buffer
@@ -1078,34 +1003,20 @@ def generate_embeddings_for_dataset(
                     repr_layer=repr_layer,
                     model_type=model_type,
                     device=device,
-                    accelerator=accelerator,
-                    embed_dim=embed_dim
+                    accelerator=accelerator
                 )
                 
-                # Verify embed_dim matches (should already be set from model)
-                if embeddings:
-                    actual_dim = embeddings[0].shape[1]
-                    if embed_dim is not None and actual_dim != embed_dim:
-                        if accelerator.is_local_main_process:
-                            accelerator.print(f"⚠️  Warning: Embedding dimension mismatch. Expected {embed_dim}, got {actual_dim}")
-                        # Update to actual dimension
-                        embed_dim = actual_dim
-                        buffer.embed_dim = embed_dim
-                    elif embed_dim is None:
-                        # Set embed_dim from first embedding
-                        embed_dim = actual_dim
-                        buffer.embed_dim = embed_dim
+                # Set embed_dim from first embedding
+                if embed_dim is None and embeddings:
+                    embed_dim = embeddings[0].shape[1]
+                    buffer.embed_dim = embed_dim
                 
                 # Add windows to buffer
                 for window_info, embedding in zip(window_batch, embeddings):
-                    # Use character positions for range (always based on original sequence)
-                    char_start = window_info.get('char_start', window_info['window_start'])
-                    char_end = window_info.get('char_end', window_info['window_end'])
-                    
                     buffer.add_window(
                         ac_id=window_info['ac_id'],
                         embedding=embedding,
-                        window_range=(char_start, char_end),  # Character positions in original sequence
+                        window_range=(window_info['window_start'], window_info['window_end']),
                         ori_seq=window_info['ori_seq_window'],
                         ptm_seq=window_info['ptm_seq_window']
                     )
@@ -1238,14 +1149,8 @@ def main():
         "--model",
         type=str,
         default="esm2_15b",
-        choices=["esm2_650m", "esm2_15b", "esm3_7b", "esmc_300m"],
-        help="ESM model to use: 'esm2_650m' (ESM2 650M), 'esm2_15b' (ESM2 15B), 'esm3_7b' (ESM3 7B), or 'esmc_300m' (ESM C 300M). Default: 'esm2_15b'",
-    )
-    parser.add_argument(
-        "--repr_layer",
-        type=int,
-        default=None,
-        help="Representation layer index to extract embeddings from. If not specified, uses model default (last layer).",
+        choices=["esm2_650m", "esm2_15b", "esm3_7b"],
+        help="ESM model to use: 'esm2_650m' (ESM2 650M), 'esm2_15b' (ESM2 15B), or 'esm3_7b' (ESM3 7B). Default: 'esm2_15b'",
     )
     args = parser.parse_args()
     
@@ -1304,45 +1209,20 @@ def main():
         if accelerator.is_local_main_process:
             accelerator.print(f"✅ Loaded {len(original_sequences_dict)} original sequences")
     
-    # Get representation layer from config or args (args takes precedence)
-    train_args = cfg.get("training", {})
-    config_repr_layer = train_args.get("repr_layer", None)
-    repr_layer_override = args.repr_layer if args.repr_layer is not None else config_repr_layer
-    
-    # Store source for logging
-    if repr_layer_override is not None:
-        if args.repr_layer is not None:
-            accelerator._repr_layer_source = 'cli'
-        else:
-            accelerator._repr_layer_source = 'config'
-    
-    if accelerator.is_local_main_process and repr_layer_override is not None:
-        source = "command line" if args.repr_layer is not None else "config"
-        accelerator.print(f"📌 Using representation layer from {source}: {repr_layer_override}")
-    
     # Load ESM model based on user choice
-    esm_model, alphabet, batch_converter, repr_layer, model_type, embed_dim = load_esm_model(
-        args.model, accelerator, repr_layer_override=repr_layer_override
+    esm_model, alphabet, batch_converter, repr_layer, model_type = load_esm_model(
+        args.model, accelerator
     )
     
-    # Prepare ESM model with accelerator (ESM C models may need special handling)
-    if model_type != "esmc":
-        esm_model = accelerator.prepare(esm_model)
-    else:
-        # ESM C models use .to() method instead of accelerator.prepare()
-        if hasattr(accelerator, 'device'):
-            esm_model = esm_model.to(accelerator.device)
-        elif hasattr(accelerator, 'local_process_index'):
-            # Fallback: try to get device from accelerator
-            device = torch.device(f"cuda:{accelerator.local_process_index}" if torch.cuda.is_available() else "cpu")
-            esm_model = esm_model.to(device)
+    # Prepare ESM model with accelerator
+    esm_model = accelerator.prepare(esm_model)
     
     if accelerator.is_local_main_process:
         accelerator.print(f"🚀 Using {accelerator.num_processes} GPU(s) for embedding generation")
         accelerator.print(f"📦 Model type: {model_type}, Representation layer: {repr_layer}")
     
     # Get max_sequence_length from training config (should match training setting)
-    # (train_args already loaded above)
+    train_args = cfg.get("training", {})
     max_sequence_length = train_args.get("max_sequence_length", None)
     
     if accelerator.is_local_main_process:
@@ -1359,7 +1239,6 @@ def main():
         batch_converter=batch_converter,
         accelerator=accelerator,
         output_dir=args.output_dir,
-        embed_dim=embed_dim,
         batch_size=args.batch_size,
         max_sequence_length=max_sequence_length,
         chunk_size_gb=args.chunk_size_gb,

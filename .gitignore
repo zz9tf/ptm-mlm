@@ -252,3 +252,4 @@ runs/
 *.temp
 .DS_Store
 Thumbs.db
+embeddings*
