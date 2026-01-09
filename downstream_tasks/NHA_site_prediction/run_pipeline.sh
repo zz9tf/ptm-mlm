@@ -3,30 +3,29 @@
 # NHA位点预测完整流程脚本
 
 source /home/zz/miniconda3/etc/profile.d/conda.sh
-conda activate ptm-mamba
+conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 set -e  # Exit on error
-export CUDA_VISIBLE_DEVICES="0"
+export CUDA_VISIBLE_DEVICES="5"
 
 # ============================================
 # 配置参数 (Configuration)
 # ============================================
 WORK_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/NHA_site_prediction"
-CHECKPOINT="${WORK_DIR}/../checkpoints/esm_650m_mamba.ckpt"  # 预训练模型checkpoint路径
+CHECKPOINT="${WORK_DIR}/../checkpoints/LoRA_fast.ckpt"  # LoRA模型checkpoint路径
 DATA="${WORK_DIR}/NHAC.csv"  # NHA数据文件
 BASE_OUTPUT_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs"  # 基础输出目录
 # 创建带日期的输出目录
 DATE_STR=$(date +"%Y-%m-%d")
-OUTPUT_DIR="${BASE_OUTPUT_DIR}/NHA_site_prediction_650M_${DATE_STR}"
-BATCH_SIZE=320
+OUTPUT_DIR="${BASE_OUTPUT_DIR}/NHA_site_prediction_esmc600_lastlayer_${DATE_STR}"
+BATCH_SIZE=512
 NUM_EPOCHS=10
 LEARNING_RATE=1e-4
 DEVICE="cuda"  # 或 "cpu"
 LAMBDA_WEIGHT=0.1  # Weight (λ) for AUCMLoss in combined loss: loss = bce_loss + λ * auc_loss
 MAX_SEQUENCE_LENGTH=512  # 最大序列长度（seq_61只有61，所以不需要滑动窗口）
-MODEL_TYPE="esm2"  # 模型类型: "mamba" 或 "esm2"
-ESM2_MODEL_NAME="facebook/esm2_t33_650M_UR50D"  # ESM2模型名称（仅在MODEL_TYPE="esm2"时使用） esm2_t48_15B_UR50D esm2_t33_650M_UR50D
+MODEL_TYPE="esmc"  # 模型类型: "mamba", "esm2", "lora", 或 "esmc"
 USE_ESM=true  # 是否加载ESM2-15B模型（仅在MODEL_TYPE="mamba"时有效）
                 # true: 使用Mamba+ESM2-15B组合（自动加载esm2_t48_15B_UR50D，匹配训练时的配置）
                 # false: 只使用Mamba模型（不加载ESM，节省内存）
@@ -48,13 +47,10 @@ echo "============================================"
 
 python3 generate_embeddings.py \
     --model_type "${MODEL_TYPE}" \
-    --checkpoint "${CHECKPOINT}" \
-    --esm2_model_name "${ESM2_MODEL_NAME}" \
     --data "${DATA}" \
     --output_dir "${OUTPUT_DIR}" \
     --batch_size ${BATCH_SIZE} \
-    --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
-    $([ "${USE_ESM}" = "true" ] && echo "--use_esm" || echo "")
+    --max_sequence_length ${MAX_SEQUENCE_LENGTH}
 
 echo "✅ Step 1 完成: Embeddings已生成"
 echo ""

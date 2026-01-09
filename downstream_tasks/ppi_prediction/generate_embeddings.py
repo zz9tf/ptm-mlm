@@ -24,7 +24,7 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Try to import both inference classes from shared inference directory
+# Try to import all inference classes from shared inference directory
 try:
     from inference import ModelInference
     MAMBA_AVAILABLE = True
@@ -37,6 +37,18 @@ try:
 except ImportError:
     ESM2_AVAILABLE = False
 
+try:
+    from inference_lora import LoRAInference
+    LORA_AVAILABLE = True
+except ImportError:
+    LORA_AVAILABLE = False
+
+try:
+    from inference_esmc import ESMCInference
+    ESMC_AVAILABLE = True
+except ImportError:
+    ESMC_AVAILABLE = False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate embeddings for PPI prediction")
@@ -44,8 +56,8 @@ def main():
         "--model_type",
         type=str,
         default="mamba",
-        choices=["mamba", "esm2"],
-        help="Model type to use: 'mamba' or 'esm2' (default: mamba)"
+        choices=["mamba", "esm2", "lora", "esmc"],
+        help="Model type to use: 'mamba', 'esm2', 'lora', or 'esmc' (default: mamba)"
     )
     parser.add_argument(
         "--checkpoint", 
@@ -56,8 +68,14 @@ def main():
     parser.add_argument(
         "--esm2_model_name",
         type=str,
-        default="facebook/esm2_t33_650M_UR50D",
-        help="ESM2 model name from HuggingFace (default: facebook/esm2_t33_650M_UR50D)"
+        default="facebook/esm2_t30_150M_UR50D",
+        help="ESM2 model name from HuggingFace (default: facebook/esm2_t30_150M_UR50D for ESM-C 600)"
+    )
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=None,
+        help="Layer index to extract (1-based for esmc, 0-based for esm2). If None, uses last layer (default: None)"
     )
     parser.add_argument(
         "--data",
@@ -162,10 +180,25 @@ def main():
             raise ImportError("ESM2 inference not available. Please install transformers: pip install transformers")
         inferencer = ESM2Inference(
             model_name=args.esm2_model_name,
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
+    elif args.model_type == "lora":
+        if not LORA_AVAILABLE:
+            raise ImportError("LoRA inference not available. Please ensure inference_lora.py exists.")
+        inferencer = LoRAInference(
+            args.checkpoint,
             max_sequence_length=args.max_sequence_length
         )
+    elif args.model_type == "esmc":
+        if not ESMC_AVAILABLE:
+            raise ImportError("ESM-C inference not available. Please install fair-esm: pip install fair-esm")
+        inferencer = ESMCInference(
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba' or 'esm2'.")
+        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba', 'esm2', 'lora', or 'esmc'.")
     
     # Process each split
     for split_name, df in [("train", train_df), ("valid", valid_df), ("test", test_df)]:
@@ -185,9 +218,11 @@ def main():
         # Generate embeddings for binder sequences
         print(f"\n🔹 Generating binder embeddings...")
         binder_embeddings_list = []
+        # LoRA 使用不同的方法名
+        generate_method = inferencer.generate_block_outputs if args.model_type == "lora" else inferencer.generate_embeddings
         for i in tqdm(range(0, len(binder_sequences), args.batch_size), desc=f"Binder embeddings ({split_name})"):
             batch_sequences = binder_sequences[i:i + args.batch_size]
-            batch_embeddings = inferencer.generate_embeddings(
+            batch_embeddings = generate_method(
                 batch_sequences,
                 batch_size=len(batch_sequences),
                 return_pooled=True,
@@ -202,7 +237,7 @@ def main():
         wt_embeddings_list = []
         for i in tqdm(range(0, len(wt_sequences), args.batch_size), desc=f"WT embeddings ({split_name})"):
             batch_sequences = wt_sequences[i:i + args.batch_size]
-            batch_embeddings = inferencer.generate_embeddings(
+            batch_embeddings = generate_method(
                 batch_sequences,
                 batch_size=len(batch_sequences),
                 return_pooled=True,
@@ -216,7 +251,7 @@ def main():
         ptm_embeddings_list = []
         for i in tqdm(range(0, len(ptm_sequences), args.batch_size), desc=f"PTM embeddings ({split_name})"):
             batch_sequences = ptm_sequences[i:i + args.batch_size]
-            batch_embeddings = inferencer.generate_embeddings(
+            batch_embeddings = generate_method(
                 batch_sequences,
                 batch_size=len(batch_sequences),
                 return_pooled=True,

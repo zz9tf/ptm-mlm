@@ -38,6 +38,18 @@ try:
 except ImportError:
     ESM2_AVAILABLE = False
 
+try:
+    from inference_lora import LoRAInference
+    LORA_AVAILABLE = True
+except ImportError:
+    LORA_AVAILABLE = False
+
+try:
+    from inference_esmc import ESMCInference
+    ESMC_AVAILABLE = True
+except ImportError:
+    ESMC_AVAILABLE = False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate embeddings for NHA site prediction")
@@ -45,8 +57,8 @@ def main():
         "--model_type",
         type=str,
         default="mamba",
-        choices=["mamba", "esm2"],
-        help="Model type to use: 'mamba' or 'esm2' (default: mamba)"
+        choices=["mamba", "esm2", "lora", "esmc"],
+        help="Model type to use: 'mamba', 'esm2', 'lora', or 'esmc' (default: mamba)"
     )
     parser.add_argument(
         "--checkpoint", 
@@ -57,8 +69,14 @@ def main():
     parser.add_argument(
         "--esm2_model_name",
         type=str,
-        default="facebook/esm2_t33_650M_UR50D",
-        help="ESM2 model name from HuggingFace (default: facebook/esm2_t33_650M_UR50D)"
+        default="facebook/esm2_t30_150M_UR50D",
+        help="ESM2 model name from HuggingFace (default: facebook/esm2_t30_150M_UR50D for ESM-C 600)"
+    )
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=None,
+        help="Layer index to extract (1-based for esmc, 0-based for esm2). If None, uses last layer (default: None)"
     )
     parser.add_argument(
         "--data",
@@ -155,10 +173,25 @@ def main():
             raise ImportError("ESM2 inference not available. Please install transformers: pip install transformers")
         inferencer = ESM2Inference(
             model_name=args.esm2_model_name,
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
+    elif args.model_type == "lora":
+        if not LORA_AVAILABLE:
+            raise ImportError("LoRA inference not available. Please ensure inference_lora.py exists.")
+        inferencer = LoRAInference(
+            args.checkpoint,
             max_sequence_length=args.max_sequence_length
         )
+    elif args.model_type == "esmc":
+        if not ESMC_AVAILABLE:
+            raise ImportError("ESM-C inference not available. Please install fair-esm: pip install fair-esm")
+        inferencer = ESMCInference(
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba' or 'esm2'.")
+        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba', 'esm2', 'lora', or 'esmc'.")
     
     # Initialize lists to collect all data from all sequence columns
     all_train_embeddings = []
@@ -199,13 +232,24 @@ def main():
             batch_labels = train_labels[i:i + args.batch_size]
             
             # Generate per-position embeddings
-            batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                batch_sequences,
-                batch_size=len(batch_sequences),
-                max_sequence_length=args.max_sequence_length,
-                use_sliding_window=args.use_sliding_window,
-                window_overlap=args.window_overlap
-            )
+            # LoRA 和 ESM-C 使用不同的方法名
+            if args.model_type == "lora":
+                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
+            else:
+                # ESM-C and other models use generate_per_position_embeddings
+                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
             
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]
@@ -241,13 +285,23 @@ def main():
             batch_sequences = valid_sequences[i:i + args.batch_size]
             batch_labels = valid_labels[i:i + args.batch_size]
             
-            batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                batch_sequences,
-                batch_size=len(batch_sequences),
-                max_sequence_length=args.max_sequence_length,
-                use_sliding_window=args.use_sliding_window,
-                window_overlap=args.window_overlap
-            )
+            # LoRA 使用不同的方法名，ESM-C 和其他模型使用 generate_per_position_embeddings
+            if args.model_type == "lora":
+                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
+            else:
+                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
             
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]
@@ -283,13 +337,23 @@ def main():
             batch_sequences = test_sequences[i:i + args.batch_size]
             batch_labels = test_labels[i:i + args.batch_size]
             
-            batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                batch_sequences,
-                batch_size=len(batch_sequences),
-                max_sequence_length=args.max_sequence_length,
-                use_sliding_window=args.use_sliding_window,
-                window_overlap=args.window_overlap
-            )
+            # LoRA 使用不同的方法名，ESM-C 和其他模型使用 generate_per_position_embeddings
+            if args.model_type == "lora":
+                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
+            else:
+                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
+                    batch_sequences,
+                    batch_size=len(batch_sequences),
+                    max_sequence_length=args.max_sequence_length,
+                    use_sliding_window=args.use_sliding_window,
+                    window_overlap=args.window_overlap
+                )
             
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]

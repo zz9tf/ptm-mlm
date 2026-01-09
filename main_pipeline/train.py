@@ -2,30 +2,26 @@ import torch
 import yaml
 import argparse
 from transformers.trainer import DataLoader
+# Removed autocast and GradScaler - using pure FP16 training
 import os
-import esm
 import json
+import gc
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import DistributedDataParallelKwargs
 from tqdm import tqdm
 from datetime import datetime
 
-from getters.ptm_dataset import (
-    DataCollatorWithPadding,
-    SequenceLengthSampler,
+from getters.ptm_dataset_memmap import (
+    get_ptm_dataset_memmap,
 )
 from accelerate.utils import set_seed
-from getters.ptm_dataset import get_ptm_dataset
 from getters.tokenizer import PTMTokenizer
 from utils.log import TrainLogger
-from utils.mask import Masker
 from utils.scheduler import Esm2LRScheduler
 from utils.config import load_config
 from utils.checkpoint import load_ckpt_from_output_dir
-from utils.esm_utils import make_esm_input_ids, compute_esm_embedding, load_esm_model, get_esm_embed_dim
-from utils.loss import mlm_loss
-from utils.embedding_loader import EmbeddingLoader
-from models.mamba.lm import MambaLMHeadModel
+from utils.esm_utils import get_esm_embed_dim
+from models.model import PTMModel
 
 
 def get_last_training_metrics(metrics_path):
@@ -86,9 +82,9 @@ def get_last_training_metrics(metrics_path):
             if "avg_test_loss" in entry and not last_test_metrics:
                 last_test_metrics = {
                     "test_loss": entry.get("avg_test_loss"),
-                    "test_acc": entry.get("avg_test_acc"),
-                    "test_ptm_acc": entry.get("avg_test_ptm_acc"),
-                    "test_preplexity": entry.get("avg_test_preplexity"),
+                    "test_acc": entry.get("test_acc"),
+                    "test_ptm_acc": entry.get("test_ptm_acc"),
+                    "test_preplexity": entry.get("test_preplexity"),
                 }
         
         result = {
@@ -115,7 +111,6 @@ def train(
     optimizer,
     scheduler,
     tokenizer,
-    masker: Masker,
     logger,
     accelerator: Accelerator,
     checkpoint_dir: str,
@@ -131,7 +126,6 @@ def train(
     @param optimizer: Optimizer instance.
     @param scheduler: Learning rate scheduler instance.
     @param tokenizer: Tokenizer instance.
-    @param masker: Masker instance.
     @param logger: Logger instance.
     @param accelerator: Accelerator instance.
     @param checkpoint_dir: Checkpoint directory with timestamp.
@@ -212,62 +206,13 @@ def train(
         if accelerator.is_local_main_process:
             accelerator.print("🚀 Starting new training from scratch")
 
-    # Initialize ESM model or embedding loader
-    use_precomputed_embeddings = train_args.get("use_precomputed_embeddings", False)
-    embeddings_dir = train_args.get("embeddings_dir", None)
-    embedding_loader = None
-    
-    # Get seed from config for reproducible window selection
-    seed = config_dict.get("seed", None)
-    
-    if train_args.get("use_esm", False):
-        if use_precomputed_embeddings and embeddings_dir:
-            # Load pre-computed embeddings
-            if accelerator.is_local_main_process:
-                print(f"📦 Loading pre-computed embeddings from {embeddings_dir}")
-                if seed is not None:
-                    print(f"🔑 Using seed {seed} for reproducible window selection")
-            embedding_loader = EmbeddingLoader(embeddings_dir, seed=seed)
-            esm_model = None
-            batch_converter = None
-        else:
-            # Use ESM model for on-the-fly computation
-            # Get ESM model name from config (default to "esm2_15b" for backward compatibility)
-            esm_model_name = train_args.get("esm_model", "esm2_15b")
-            
-            # Get representation layer from config
-            repr_layer_override = train_args.get("repr_layer", None)
-            
-            # Load ESM model using utility function
-            esm_model, alphabet, batch_converter, repr_layer, model_type, _ = load_esm_model(
-                esm_model_name, accelerator, repr_layer_override=repr_layer_override
-            )
-            
-            # Prepare ESM model with accelerator for distributed training support
-            if model_type != "esmc":
-                esm_model = accelerator.prepare(esm_model)
-            else:
-                # ESM C models use .to() method instead of accelerator.prepare()
-                if hasattr(accelerator, 'device'):
-                    esm_model = esm_model.to(accelerator.device)
-                elif hasattr(accelerator, 'local_process_index'):
-                    # Fallback: try to get device from accelerator
-                    device = torch.device(f"cuda:{accelerator.local_process_index}" if torch.cuda.is_available() else "cpu")
-                    esm_model = esm_model.to(device)
-            
-    else:
-        esm_model = None
-        batch_converter = None
+    # Embeddings are already loaded in the dataset, no need for separate loader
     
     model_to_save = model if accelerator.distributed_type==DistributedType.NO else model.module
-    masking_fn = masker.random_or_random_and_ptm_mask
     total_steps = start_step
     
-    # Calculate total steps for progress bar
-    num_epochs = train_args.get("num_train_epochs", 10)
-    total_train_steps = len(train_loader) * num_epochs
-    
     # Debug: Print epoch range
+    num_epochs = train_args.get("num_train_epochs", 10)
     if accelerator.is_local_main_process:
         accelerator.print(f"🔍 Debug Info:")
         accelerator.print(f"   - start_epoch: {start_epoch}")
@@ -286,99 +231,123 @@ def train(
         
         for batch in train_pbar:
             optimizer.zero_grad()
-            input_ids = batch["input_ids"]
-            unique_ids = batch.get("unique_ids", None)
             
-            # compute ESM embedding
-            if train_args.get("use_esm", False):
-                if embedding_loader is not None and unique_ids is not None:
-                    # 🔍 Step 1: Check which samples have embeddings available
-                    # unique_ids are original_ids (e.g., 'P47114'), not window_ids
-                    has_emb_mask = embedding_loader.has_embeddings(unique_ids, is_training=True)
-                    
-                    # ⚠️ Warning for samples without embeddings (should not happen)
-                    missing_indices = [i for i, has_emb in enumerate(has_emb_mask) if not has_emb]
-                    if missing_indices:
-                        missing_ids = [unique_ids[i] for i in missing_indices]
-                        if accelerator.is_local_main_process:
-                            accelerator.print(f"⚠️ Warning: {len(missing_indices)} samples without ESM embeddings (should not happen): {missing_ids[:5]}...")
-                    
-                    # Skip batch if no samples have embeddings
-                    if not any(has_emb_mask):
-                        continue
-                    
-                    # 🔍 Step 2: Filter samples that have embeddings
-                    valid_indices = [i for i, has_emb in enumerate(has_emb_mask) if has_emb]
-                    filtered_unique_ids = [unique_ids[i] for i in valid_indices]  # original_ids
-                    filtered_input_ids = input_ids[valid_indices]
-                    
-                    # 🔍 Step 3: Get embeddings for filtered samples (returns embeddings, ranges, seq_lengths)
-                    # get_embeddings will: select window -> retrieve ONE window's embedding and its range
-                    result = embedding_loader.get_embeddings(filtered_unique_ids, device, is_training=True)
-                    if result is None:
-                        # Should not happen since we already checked, but handle gracefully
-                        if accelerator.is_local_main_process:
-                            accelerator.print("⚠️ Warning: Failed to get embeddings even though has_embeddings returned True")
-                        continue
-                    
-                    embedding, ranges, seq_lengths = result
-                    
-                    # 🔍 Step 4: Crop input_ids according to selected window ranges
-                    # The embedding represents a randomly selected window, so we need to crop input_ids using the range
-                    batch_size = filtered_input_ids.shape[0]
-                    cropped_input_ids = torch.zeros_like(filtered_input_ids)
-                    for i in range(batch_size):
-                        start, end = ranges[i]
-                        # Crop input_ids according to the window range
-                        cropped_input_ids[i, :(end - start)] = filtered_input_ids[i, start:end]
-                        # Keep padding tokens (0) for positions beyond the window
-                    
-                    # 🔍 Step 5: Apply masking to cropped input_ids
-                    masked_input_ids, pred_mask = masking_fn(cropped_input_ids)
-                    
-                    # Update input_ids to use cropped version
-                    input_ids = cropped_input_ids
-                else:
-                    # On-the-fly computation (no embedding loader or no unique_ids)
-                    # masking
-                    masked_input_ids, pred_mask = masking_fn(input_ids)
-                    esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
-                    masked_esm_input_ids = esm_input_ids.clone()
-                    masked_esm_input_ids[pred_mask] = tokenizer.mask_token_id
-                    embedding = compute_esm_embedding(
-                        tokenizer, esm_model, batch_converter, masked_esm_input_ids, accelerator
+            # Get data from batch (already tokenized in collate_fn)
+            # Embeddings 已经是 float16，只需传输到 device，保持原有精度
+            embeddings = batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
+            pad_mask = batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            original_input_ids = batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            ptm_input_ids = batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+            # Get functional role data if available
+            functional_role = batch.get("functional_role", None)
+            functional_role_position = batch.get("functional_role_position", None)
+            if functional_role is not None:
+                functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+            # Get PTM mask (positions where tokens are PTM tokens)
+            ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
+            
+            # 🚀 纯 FP16: 直接前向传播 (模型参数已经是 float16)
+            # Forward pass through model
+            outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor] - {head_name: logits}
+
+            # Get the actual model (handle accelerator wrapping)
+            actual_model = model.module if hasattr(model, 'module') else model
+
+            # Compute loss for each head using model's compute_loss method
+            losses_compute_related = {}
+            for head_type, logits in outputs.items():
+                loss_compute_related = {
+                    "logits": logits,
+                    "target": original_input_ids if head_type == "original" else ptm_input_ids,
+                    "kwargs": {
+                        "device": device,
+                    }
+                }
+                # Add ptm_mask for PTM head
+                if head_type == "ptm":
+                    loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
+
+                losses_compute_related[head_type] = loss_compute_related
+
+            # Compute losses using model's compute_loss method
+            losses = actual_model.compute_loss(losses_compute_related)
+            total_loss = losses["total"]
+
+            # Add functional role BCE loss if available
+            if functional_role is not None and "functional_role" in outputs:
+                # TODO: 用户需要细化具体的functional role loss计算方式
+                # 目前使用基本的BCE loss作为占位符
+                functional_role_logits = outputs["functional_role"]  # (batch_size, max_seq_len, 1) or similar
+                # 计算functional role位置的BCE loss
+                functional_role_mask = (functional_role_position > 0)  # 假设>0表示有functional role
+                if functional_role_mask.any():
+                    # 将logits squeeze到最后一维并计算BCE
+                    fr_logits = functional_role_logits.squeeze(-1)  # (batch_size, max_seq_len)
+                    fr_loss = F.binary_cross_entropy_with_logits(
+                        fr_logits[functional_role_mask],
+                        functional_role[functional_role_mask]
                     )
-            else:
-                # No ESM embedding needed
-                # masking
-                masked_input_ids, pred_mask = masking_fn(input_ids)
-                embedding = None
+                    # 将functional role loss加到总loss中 (可以调整权重)
+                    functional_role_weight = 1.0  # TODO: 可以从config中读取
+                    total_loss = total_loss + functional_role_weight * fr_loss
+                    losses["functional_role"] = fr_loss
             
-            # forward pass
-            outputs = model(masked_input_ids, embedding=embedding)
-            logits = outputs.logits
-            loss = mlm_loss(logits, input_ids, pred_mask)
+            # Compute accuracy for each head
+            head_accs = {}
+            for head_type, logits in outputs.items():
+                if head_type == "original":
+                    # Accuracy at all non-padding positions
+                    non_padding_mask = pad_mask & (original_input_ids != 0)
+                    if non_padding_mask.any():
+                        acc = (logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
+                    else:
+                        acc = torch.tensor(0.0, device=device)
+                elif head_type == "ptm":
+                    # Accuracy at PTM positions only
+                    if ptm_mask.any():
+                        acc = (logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
+                    else:
+                        acc = torch.tensor(0.0, device=device)
+                else:
+                    acc = torch.tensor(0.0, device=device)
+                head_accs[head_type] = acc
             
-            # backward pass
-            accelerator.backward(loss)
+            # Get accuracies for logging
+            acc = head_accs.get("original", torch.tensor(0.0, device=device))
+            ptm_acc = head_accs.get("ptm", torch.tensor(0.0, device=device))
             
-            # compute accuracy
-            preplexity = torch.exp(loss)
-            acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-            # Compute PTM accuracy - handle case when no PTM tokens are masked
-            ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-            if ptm_mask.any():
-                ptm_acc = (
-                    (logits.argmax(dim=-1) == input_ids)[ptm_mask]
-                    .float()
-                    .mean()
-                )
-            else:
-                # No PTM tokens masked in this batch, set accuracy to 0.0
-                ptm_acc = torch.tensor(0.0, device=device)
+            # Save batch size and sequence length for logging before cleanup
+            batch_size = embeddings.shape[0]
+            seq_len = embeddings.shape[1]
             
-            # update parameters
+            # 🚀 AMP: 使用 Accelerate 的混合精度训练
+            accelerator.backward(total_loss)
+
+            # ✅ 梯度裁剪：在 step 前防止梯度爆炸
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 🚀 AMP: Accelerate 会自动处理 scaler
             optimizer.step()
+
+            # 📊 修复 perplexity 计算：FP32 + clamp 防止溢出
+            preplexity = torch.exp(torch.clamp(total_loss.detach().float(), max=10))
+
+            # 🔊 调试：监控梯度范数 (前几步)
+            if total_steps <= 2 and accelerator.is_local_main_process:
+                # 计算梯度范数用于调试
+                total_norm = 0
+                param_count = 0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                total_norm = total_norm ** (1. / 2)
+                print(f"AMP Debug: grad_norm = {total_norm:.6f} (from {param_count} params)")
+
             # update learning rate
             scheduler.step()
             
@@ -387,7 +356,7 @@ def train(
             current_lr = optimizer.param_groups[0]['lr'] if accelerator.is_local_main_process else 0.0
             if accelerator.is_local_main_process:
                 train_pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
+                    "loss": f"{total_loss.item():.4f}",
                     "acc": f"{acc.item():.4f}",
                     "ptm_acc": f"{ptm_acc.item():.4f}",
                     "ppl": f"{preplexity.item():.2f}",
@@ -397,15 +366,22 @@ def train(
                     {
                         "Epoch": epoch,
                         "Step": total_steps,
-                        "train_loss": loss.item(),
+                        "train_loss": total_loss.item(),
                         "train_preplexity": preplexity.item(),
                         "train_acc": acc.item(),
                         "train_ptm_acc": ptm_acc.item(),
-                        "act_bs": input_ids.shape[0],
-                        "act_seq_len": input_ids.shape[1],
+                        "act_bs": batch_size,
+                        "act_seq_len": seq_len,
                     }
                 )
             total_steps += 1
+            
+            # Clean up batch variables after logging
+            del outputs, losses_compute_related, losses, head_accs, preplexity, acc, ptm_acc, total_loss
+            del embeddings, pad_mask, original_input_ids, ptm_input_ids, ptm_mask
+            
+            # Removed frequent empty_cache() calls - only clear at epoch/validation end
+            
             if total_steps % train_args.get("log_steps", 100) == 0:
                 # evaluate on validation set
                 model.eval()
@@ -424,60 +400,84 @@ def train(
                 
                 for val_batch in val_pbar:
                     with torch.no_grad():
-                        input_ids = val_batch["input_ids"]
-                        unique_ids = val_batch.get("unique_ids", None)
+                        # Get data from batch (already tokenized in collate_fn)
+                        # Embeddings 已经是 float16，只需传输到 device，保持原有精度
+                        embeddings = val_batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
+                        pad_mask = val_batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                        original_input_ids = val_batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                        ptm_input_ids = val_batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+                        # Get functional role data if available
+                        functional_role = val_batch.get("functional_role", None)
+                        functional_role_position = val_batch.get("functional_role_position", None)
+                        if functional_role is not None:
+                            functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                            functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+                        # Get PTM mask
+                        ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
                         
-                        if train_args.get("use_esm", False):
-                            if embedding_loader is not None and unique_ids is not None:
-                                # Use pre-computed embeddings (fixed window selection for validation)
-                                result = embedding_loader.get_embeddings(unique_ids, device, is_training=False)
-                                if result is None:
-                                    esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
-                                    masked_esm_input_ids = esm_input_ids.clone()
-                                    masked_esm_input_ids[pred_mask] = tokenizer.mask_token_id
-                                    embedding = compute_esm_embedding(
-                                        tokenizer, esm_model, batch_converter, masked_esm_input_ids, accelerator
-                                    )
-                                else:
-                                    embedding, ranges, seq_lengths = result
-                                    # Crop input_ids according to selected window ranges
-                                    batch_size = input_ids.shape[0]
-                                    cropped_input_ids = torch.zeros_like(input_ids)
-                                    for i in range(batch_size):
-                                        start, end = ranges[i]
-                                        cropped_input_ids[i, :(end - start)] = input_ids[i, start:end]
-                                    # Apply masking to cropped input_ids
-                                    masked_input_ids, pred_mask = masking_fn(cropped_input_ids)
-                                    input_ids = cropped_input_ids
-                            else:
-                                # On-the-fly computation
-                                masked_input_ids, pred_mask = masking_fn(input_ids)
-                                esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
-                                masked_esm_input_ids = esm_input_ids.clone()
-                                masked_esm_input_ids[pred_mask] = tokenizer.mask_token_id
-                                embedding = compute_esm_embedding(
-                                    tokenizer, esm_model, batch_converter, masked_esm_input_ids, accelerator
+                        # 🚀 纯 FP16: 验证前向传播
+                        # Forward pass through model
+                        outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor]
+
+                        # Get the actual model (handle accelerator wrapping)
+                        actual_model = model.module if hasattr(model, 'module') else model
+
+                        # Compute loss for each head using model's compute_loss method
+                        losses_compute_related = {}
+                        for head_type, logits in outputs.items():
+                            loss_compute_related = {
+                                "logits": logits,
+                                "target": original_input_ids if head_type == "original" else ptm_input_ids,
+                                "kwargs": {
+                                    "device": device,
+                                }
+                            }
+                            # Add ptm_mask for PTM head
+                            if head_type == "ptm":
+                                loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
+
+                            losses_compute_related[head_type] = loss_compute_related
+
+                        # Compute losses using model's compute_loss method
+                        losses = actual_model.compute_loss(losses_compute_related)
+                        loss = losses["total"]
+
+                        # Add functional role BCE loss if available
+                        if functional_role is not None and "functional_role" in outputs:
+                            # TODO: 用户需要细化具体的functional role loss计算方式
+                            functional_role_logits = outputs["functional_role"]
+                            functional_role_mask = (functional_role_position > 0)
+                            if functional_role_mask.any():
+                                fr_logits = functional_role_logits.squeeze(-1)
+                                fr_loss = F.binary_cross_entropy_with_logits(
+                                    fr_logits[functional_role_mask],
+                                    functional_role[functional_role_mask]
                                 )
+                                # 将functional role loss加到总loss中
+                                functional_role_weight = 1.0  # TODO: 可以从config中读取
+                                loss = loss + functional_role_weight * fr_loss
+                        
+                        # Compute accuracy for each head
+                        original_logits = outputs.get("original", None)
+                        ptm_logits = outputs.get("ptm", None)
+                        
+                        # Accuracy on original (at non-padding positions)
+                        non_padding_mask = pad_mask & (original_input_ids != 0)
+                        if non_padding_mask.any() and original_logits is not None:
+                            acc = (original_logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
                         else:
-                            embedding = None
-                            masked_input_ids, pred_mask = masking_fn(input_ids)
-                        outputs = model(masked_input_ids, embedding=embedding)
-                        logits = outputs.logits
-                        loss = mlm_loss(logits, input_ids, pred_mask)
-                    # compute accuracy
+                            acc = torch.tensor(0.0, device=device)
+                        
+                        # Compute PTM accuracy on ptm at PTM sites
+                        if ptm_mask.any() and ptm_logits is not None:
+                            ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
+                        else:
+                            ptm_acc = torch.tensor(0.0, device=device)
+                    
+                    # compute perplexity
                     preplexity = torch.exp(loss)
-                    acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-                    # Compute PTM accuracy - handle case when no PTM tokens are masked
-                    ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-                    if ptm_mask.any():
-                        ptm_acc = (
-                            (logits.argmax(dim=-1) == input_ids)[ptm_mask]
-                            .float()
-                            .mean()
-                        )
-                    else:
-                        # No PTM tokens masked in this batch, set accuracy to 0.0
-                        ptm_acc = torch.tensor(0.0, device=device)
                     
                     # Accumulate metrics for averaging
                     val_losses.append(loss.item())
@@ -503,6 +503,15 @@ def train(
                                 "val_ptm_acc": ptm_acc.item(),
                             }
                         )
+                    
+                    # Clean up validation batch variables
+                    del embeddings, pad_mask, original_input_ids, ptm_input_ids, ptm_mask
+                    del outputs, losses_compute_related, losses, original_logits, ptm_logits
+                    del acc, ptm_acc, preplexity, loss, non_padding_mask
+                
+                # Clean up validation variables and clear cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # Calculate and log average validation metrics
                 if accelerator.is_local_main_process and len(val_losses) > 0:
@@ -560,6 +569,22 @@ def train(
                         last_ckpt_path,
                     )
                     accelerator.print(f"Epoch {epoch}, Step {total_steps} finished!")
+                
+                # Clean up validation variables
+                del val_losses, val_ppls, val_accs, val_ptm_accs
+                model.train()  # Set model back to training mode
+                
+                # Clear CUDA cache after validation
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Clean up epoch-level variables and clear cache at end of each epoch
+        del train_pbar
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Force garbage collection to help with memory fragmentation
+            gc.collect()
+    
     if accelerator.is_local_main_process:
         # save last model with training state
         torch.save(
@@ -597,61 +622,84 @@ def train(
             
             for test_batch in test_pbar:
                 with torch.no_grad():
-                    input_ids = test_batch["input_ids"]
-                    unique_ids = test_batch.get("unique_ids", None)
+                    # Get data from batch (already tokenized in collate_fn)
+                    # Embeddings 已经是 float16，只需传输到 device，保持原有精度
+                    embeddings = test_batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
+                    pad_mask = test_batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                    original_input_ids = test_batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                    ptm_input_ids = test_batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+                    # Get functional role data if available
+                    functional_role = test_batch.get("functional_role", None)
+                    functional_role_position = test_batch.get("functional_role_position", None)
+                    if functional_role is not None:
+                        functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                        functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+
+                    # Get PTM mask
+                    ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
                     
-                    if train_args.get("use_esm", False):
-                        if embedding_loader is not None and unique_ids is not None:
-                            # Use pre-computed embeddings (fixed window selection for test)
-                            result = embedding_loader.get_embeddings(unique_ids, device, is_training=False)
-                            if result is None:
-                                esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
-                                masked_esm_input_ids = esm_input_ids.clone()
-                                masked_esm_input_ids[pred_mask] = tokenizer.mask_token_id
-                                embedding = compute_esm_embedding(
-                                    tokenizer, esm_model, batch_converter, masked_esm_input_ids, accelerator
-                                )
-                            else:
-                                embedding, ranges, seq_lengths = result
-                                # Crop input_ids according to selected window ranges
-                                batch_size = input_ids.shape[0]
-                                cropped_input_ids = torch.zeros_like(input_ids)
-                                for i in range(batch_size):
-                                    start, end = ranges[i]
-                                    cropped_input_ids[i, :(end - start)] = input_ids[i, start:end]
-                                # Apply masking to cropped input_ids
-                                masked_input_ids, pred_mask = masking_fn(cropped_input_ids)
-                                input_ids = cropped_input_ids
-                        else:
-                            # On-the-fly computation
-                            masked_input_ids, pred_mask = masking_fn(input_ids)
-                            esm_input_ids = make_esm_input_ids(input_ids, tokenizer)
-                            masked_esm_input_ids = esm_input_ids.clone()
-                            masked_esm_input_ids[pred_mask] = tokenizer.mask_token_id
-                            embedding = compute_esm_embedding(
-                                tokenizer, esm_model, batch_converter, masked_esm_input_ids, accelerator
+                    # 🚀 纯 FP16: 测试前向传播
+                    # Forward pass through model
+                    outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor]
+
+                    # Get the actual model (handle accelerator wrapping)
+                    actual_model = model.module if hasattr(model, 'module') else model
+
+                    # Compute loss for each head using model's compute_loss method
+                    losses_compute_related = {}
+                    for head_type, logits in outputs.items():
+                        loss_compute_related = {
+                            "logits": logits,
+                            "target": original_input_ids if head_type == "original" else ptm_input_ids,
+                            "kwargs": {
+                                "device": device,
+                            }
+                        }
+                        # Add ptm_mask for PTM head
+                        if head_type == "ptm":
+                            loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
+
+                        losses_compute_related[head_type] = loss_compute_related
+
+                    # Compute losses using model's compute_loss method
+                    losses = actual_model.compute_loss(losses_compute_related)
+                    loss = losses["total"]
+
+                    # Add functional role BCE loss if available
+                    if functional_role is not None and "functional_role" in outputs:
+                        # TODO: 用户需要细化具体的functional role loss计算方式
+                        functional_role_logits = outputs["functional_role"]
+                        functional_role_mask = (functional_role_position > 0)
+                        if functional_role_mask.any():
+                            fr_logits = functional_role_logits.squeeze(-1)
+                            fr_loss = F.binary_cross_entropy_with_logits(
+                                fr_logits[functional_role_mask],
+                                functional_role[functional_role_mask]
                             )
+                            # 将functional role loss加到总loss中
+                            functional_role_weight = 1.0  # TODO: 可以从config中读取
+                            loss = loss + functional_role_weight * fr_loss
+                    
+                    # Compute accuracy for each head
+                    original_logits = outputs.get("original", None)
+                    ptm_logits = outputs.get("ptm", None)
+                    
+                    # Accuracy on original (at non-padding positions)
+                    non_padding_mask = pad_mask & (original_input_ids != 0)
+                    if non_padding_mask.any() and original_logits is not None:
+                        acc = (original_logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
                     else:
-                        embedding = None
-                        masked_input_ids, pred_mask = masking_fn(input_ids)
-                    outputs = model(masked_input_ids, embedding=embedding)
-                    logits = outputs.logits
-                    loss = mlm_loss(logits, input_ids, pred_mask)
+                        acc = torch.tensor(0.0, device=device)
+                    
+                    # Compute PTM accuracy on ptm at PTM sites
+                    if ptm_mask.any() and ptm_logits is not None:
+                        ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
+                    else:
+                        ptm_acc = torch.tensor(0.0, device=device)
                 
-                # compute accuracy
+                # compute perplexity
                 preplexity = torch.exp(loss)
-                acc = (logits.argmax(dim=-1) == input_ids)[pred_mask].float().mean()
-                # Compute PTM accuracy - handle case when no PTM tokens are masked
-                ptm_mask = pred_mask & tokenizer.is_ptm_token(input_ids).to(device)
-                if ptm_mask.any():
-                    ptm_acc = (
-                        (logits.argmax(dim=-1) == input_ids)[ptm_mask]
-                        .float()
-                        .mean()
-                    )
-                else:
-                    # No PTM tokens masked in this batch, set accuracy to 0.0
-                    ptm_acc = torch.tensor(0.0, device=device)
                 
                 # Accumulate metrics
                 test_losses.append(loss.item())
@@ -708,13 +756,14 @@ def main():
     Main training function.
     """
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="PTM-Mamba Training")
+    parser = argparse.ArgumentParser(description="PTM-Mamba Training (Memmap Format)")
     parser.add_argument(
         "--config",
         type=str,
         default="configs/base.yaml",
         help="Path to configuration YAML file",
     )
+    
     # Use parse_known_args to capture unknown arguments (like Hydra-style key=value)
     args, unknown_args = parser.parse_known_args()
     
@@ -771,7 +820,10 @@ def main():
     model_config = cfg["model"]
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     # Now Accelerator initializes and can only see GPUs specified in CUDA_VISIBLE_DEVICES
-    accelerator = Accelerator(kwargs_handlers=[kwargs])
+    accelerator = Accelerator(
+        kwargs_handlers=[kwargs],
+        mixed_precision="bf16"  # 启用内置 AMP + GradScaler
+    )
     device = accelerator.device
     set_seed(cfg.get("seed", 42))
     
@@ -792,7 +844,7 @@ def main():
             print(f"📂 Resuming in existing output directory: {output_dir}")
     else:
         # Create new output directory
-        exp_name = cfg.get("exp_name", "ptm-mamba")
+        exp_name = cfg.get("exp_name", "ptm-mamba-memmap")
         timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         output_dir = f"outputs/{exp_name}-{timestamp}"
         
@@ -828,18 +880,35 @@ def main():
         )
 
     tokenizer = PTMTokenizer()
-    # Use main seed for split_seed if not explicitly provided (for reproducibility)
-    split_seed = data_config.get("split_seed", cfg.get("seed", 42))
-    dataset = get_ptm_dataset(
-        tokenizer=tokenizer,
-        dataset_location=data_config["dataset_location"],
-        sequence_column_name=data_config["sequence_column_name"],
-        val_size=data_config.get("val_size", 0),
-        test_size=data_config.get("test_size", 0),
-        split=data_config.get("split", True),
-        subsample_size=data_config.get("subsample_size", None),
-        split_seed=split_seed,
-        max_sequence_length=data_config.get("max_sequence_length", None),
+    seed = cfg.get("seed", None)
+    
+    # Get dataset directory (memmap directory)
+    dataset_dir = data_config.get("dataset_dir", None)
+    if dataset_dir is None:
+        raise ValueError("dataset_dir must be provided in dataset config. This should point to the directory containing memmap files (embeddings_combined_memmap)")
+    
+    # Get split parameters
+    val_size = data_config.get("val_size", 0)
+    test_size = data_config.get("test_size", 0)
+    
+    # Get preload_all flag (from command line or config)
+    preload_all = data_config.get("preload_all", False)
+
+    # Get use_functional_role flag (from command line or config)
+    use_functional_role = data_config.get("use_functional_role", False)
+    
+    # Load dataset from memmap format and split
+    if accelerator.is_local_main_process:
+        mode_str = "preload mode" if preload_all else "memmap mode"
+        print(f"🚀 Loading dataset from memmap format ({mode_str}): {dataset_dir}")
+    dataset = get_ptm_dataset_memmap(
+        dataset_dir=dataset_dir,
+        device=torch.device('cpu'),  # 数据先放在CPU，让pin_memory处理GPU传输
+        seed=seed,
+        val_size=val_size,
+        test_size=test_size,
+        preload_all=preload_all,
+        use_functional_role=use_functional_role,
     )
     
     # Log dataset split information and save split mapping (only on main process)
@@ -848,22 +917,11 @@ def main():
             "train_size": len(dataset["train"]) if "train" in dataset and dataset["train"] is not None else 0,
             "val_size": len(dataset["val"]) if "val" in dataset and dataset["val"] is not None else 0,
             "test_size": len(dataset["test"]) if "test" in dataset and dataset["test"] is not None else 0,
-            "split_seed": data_config.get("split_seed", None),
-            "val_size_config": data_config.get("val_size", 0),
-            "test_size_config": data_config.get("test_size", 0),
         }
         logger.log({"dataset_split": dataset_info})
         accelerator.print(f"📊 Dataset split - Train: {dataset_info['train_size']}, Val: {dataset_info['val_size']}, Test: {dataset_info['test_size']}")
-        split_mapping = dataset.get("split_mapping", {})
         
-        # Also create mapping from samples if split_mapping not available
-        if not split_mapping:
-            split_mapping = {}
-            for split_name in ["train", "val", "test"]:
-                if split_name in dataset and dataset[split_name] is not None:
-                    for sample in dataset[split_name].samples:
-                        unique_id = sample.get("unique_id", "unknown")
-                        split_mapping[unique_id] = split_name
+        split_mapping = dataset.get("split_mapping", {})
         
         # Save split mapping to output directory
         if split_mapping:
@@ -880,91 +938,173 @@ def main():
             accelerator.print(f"   Split summary: {split_summary}")
 
     # Auto-detect esm_embed_dim from ESM model name (must be done before model initialization)
-    if train_args.get("use_esm", False):
-        # Get dimension from model name (works for both precomputed and on-the-fly)
-        esm_model_name = train_args.get("esm_model", "esm2_15b")
-        repr_layer_override = train_args.get("repr_layer", None)
-        try:
-            model_config["esm_embed_dim"] = get_esm_embed_dim(esm_model_name, repr_layer_override)
-            if accelerator.is_local_main_process:
-                accelerator.print(f"✅ Auto-detected ESM embedding dimension: {model_config['esm_embed_dim']} (from {esm_model_name})")
-        except Exception as e:
-            if accelerator.is_local_main_process:
-                accelerator.print(f"❌ Failed to auto-detect ESM embedding dimension: {e}")
-                accelerator.print(f"⚠️  Falling back to default: 5120 (esm2_15b)")
-            model_config["esm_embed_dim"] = 5120  # Default fallback
-    else:
-        # ESM not used, set to None
-        model_config["esm_embed_dim"] = None
+    # ESM model is always used, so we always need to set esm_embed_dim
+    esm_model_name = train_args.get("esm_model", "esm2_15b")
+    repr_layer_override = train_args.get("repr_layer", None)
+    try:
+        embed_dim = get_esm_embed_dim(esm_model_name, repr_layer_override)
+        if accelerator.is_local_main_process:
+            accelerator.print(f"✅ Auto-detected ESM embedding dimension: {embed_dim} (from {esm_model_name})")
+    except Exception as e:
+        if accelerator.is_local_main_process:
+            accelerator.print(f"❌ Failed to auto-detect ESM embedding dimension: {e}")
+            accelerator.print(f"⚠️  Falling back to default: 5120 (esm2_15b)")
+        embed_dim = 5120  # Default fallback
+    
+    # Get model configuration
+    vocab_size = tokenizer.get_vocab_size()
+    d_model = model_config.get("d_model", 512)
+    block_config = model_config.get("block_config", {"type": "lora"})
+    # Heads config: 'type' is used both for registry lookup and as key in model.heads
+    heads_config = model_config.get("heads_config", [
+        {"type": "original"},
+        {"type": "ptm"},
+    ])
     
     # Handle checkpoint loading from output directory
     if resume_from_output:
         # Resume from output directory (always loads from last.ckpt)
         # Note: epoch and best_loss will be loaded from metrics.json in train() function
-        model, _, _ = load_ckpt_from_output_dir(
-            resume_from_output,
-            tokenizer,
-            accelerator,
-            optimizer=None,  # Will be restored after optimizer is created
-            scheduler=None,  # Will be restored after scheduler is created
+        ckpt_path = os.path.join(resume_from_output, "last.ckpt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        model_config_dict = ckpt["config"]
+        
+        # Initialize PTMModel with saved config
+        model = PTMModel(
+            embed_dim=embed_dim,
+            vocab_size=vocab_size,
+            d_model=model_config_dict.get("d_model", d_model),
+            block_config=model_config_dict.get("block_config", block_config),
+            heads_config=model_config_dict.get("heads_config", heads_config),
+            device=device,
+            dtype=torch.float16,  # 统一使用 float16 精度
         )
-        accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
+        
+        # Load state dict
+        model.load_state_dict(ckpt["model"], strict=True)
+        # 检查 checkpoint 参数类型，仅在需要时转换（避免不必要的转换）
+        first_param = next(model.parameters())
+        if first_param.dtype != torch.float16:
+            # Checkpoint 是 float32，需要转换为 float16（仅转换一次）
+            model = model.to(dtype=torch.float16)
+            accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
+            accelerator.print(f"   Checkpoint was float32, converted to float16")
+        else:
+            # Checkpoint 已经是 float16，无需转换
+            accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
+            accelerator.print(f"   Checkpoint already in float16, no conversion needed")
     else:
-        # Create a simple namespace-like object for model config
-        from types import SimpleNamespace
-        model_config_obj = SimpleNamespace(**model_config)
-        model_config_obj.vocab_size = tokenizer.get_vocab_size()
-        model = MambaLMHeadModel(config=model_config_obj, device=device)
+        # Initialize PTMModel with block and heads configuration
+        model = PTMModel(
+            embed_dim=embed_dim,
+            vocab_size=vocab_size,
+            d_model=d_model,
+            block_config=block_config,
+            heads_config=heads_config,
+            device=device,
+            dtype=torch.float32,  # FP32 权重，让 AMP 处理前向精度
+        )
+    # 模型初始化时已指定 dtype=torch.float16，参数自动为 float16，无需转换
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     accelerator.print(f"Number of parameters: {num_params:,}")
-    sampler = SequenceLengthSampler(
-        dataset["train"], train_args.get("sort_by_seq", True), train_args.get("sample_len_ascending", True))
-    # Determine crop mode: use fixed crop if using pre-computed embeddings, random crop otherwise
-    use_precomputed = train_args.get("use_precomputed_embeddings", False)
-    random_crop_train = not use_precomputed  # Random crop for training (data augmentation) if not using pre-computed embeddings
-    random_crop_eval = False  # Always use fixed crop for validation/test (consistency)
+    accelerator.print(f"Model precision: {next(model.parameters()).dtype}")
     
+    # Create data loaders - memmap格式直接使用orig_ids和ptm_ids，不需要tokenize
+    def collate_fn(batch):
+        """
+        优化后的 collate function：
+        1. Stacks embeddings (保持 float16，避免不必要的转换)
+        2. 批量创建 pad_mask 和输入 tensors
+        3. 移除字符串对象以提高性能
+        """
+        batch_size = len(batch)
+        max_seq_len = batch[0]["embeddings"].shape[0]  # 所有样本都有相同形状
+
+        # 批量堆叠 embeddings（保持 float16 CPU tensor）
+        embeddings = torch.stack([item["embeddings"] for item in batch])  # (batch_size, max_seq_len, embed_dim)
+
+        # 收集序列长度
+        seq_lengths = [item["seq_length"] for item in batch]
+
+        # 批量创建 pad_mask（向量化操作，比循环快）
+        seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
+        pad_mask = torch.arange(max_seq_len, device='cpu').unsqueeze(0) < seq_lengths_tensor.unsqueeze(1)  # (batch_size, max_seq_len)
+
+        # 批量创建输入 tensors（避免逐个 copy）
+        orig_ids_list = [item["orig_ids"] for item in batch]
+        ptm_ids_list = [item["ptm_ids"] for item in batch]
+
+        # 使用 torch.stack 而不是逐个 from_numpy（更高效）
+        original_input_ids = torch.stack([torch.from_numpy(ids) for ids in orig_ids_list]).long()
+        ptm_input_ids = torch.stack([torch.from_numpy(ids) for ids in ptm_ids_list]).long()
+
+        # 检查是否有functional role数据
+        has_functional_role = "functional_role" in batch[0]
+        if has_functional_role:
+            functional_role_list = [item["functional_role"] for item in batch]
+            functional_role_position_list = [item["functional_role_position"] for item in batch]
+
+            # 使用 torch.stack 处理functional role数据
+            functional_role = torch.stack([torch.from_numpy(fr) for fr in functional_role_list]).float()
+            functional_role_position = torch.stack([torch.from_numpy(frp) for frp in functional_role_position_list]).long()
+
+        # 基础返回结构（移除字符串对象）
+        result = {
+            "embeddings": embeddings,  # float16 CPU tensor
+            "pad_mask": pad_mask,      # bool CPU tensor
+            "original_input_ids": original_input_ids,  # long CPU tensor
+            "ptm_input_ids": ptm_input_ids,           # long CPU tensor
+            "seq_lengths": seq_lengths,               # list of int
+        }
+
+        # 可选：只在需要时添加 unique_ids（从 protein_idx 映射）
+        protein_indices = [item.get("protein_idx") for item in batch]
+        if all(pid is not None for pid in protein_indices):
+            result["protein_indices"] = protein_indices
+
+        # 如果有functional role数据，添加到结果中
+        if has_functional_role:
+            result["functional_role"] = functional_role  # float CPU tensor
+            result["functional_role_position"] = functional_role_position  # long CPU tensor
+
+        return result
+    
+    # 🚀 优化 DataLoader 配置：多 worker + prefetch + persistent workers
+    num_workers = 4 if not preload_all else 0  # 预加载模式用单线程，避免重复加载
     train_loader = DataLoader(
         dataset["train"],
         batch_size=train_args["per_device_train_batch_size"],
-        sampler=sampler,
-        collate_fn=DataCollatorWithPadding(
-            max_tokens=train_args["max_tokens_per_batch"],
-            tokenizer=tokenizer,
-            batch_by_tokens=True,
-            max_seq_len=train_args.get("max_sequence_length", None),
-            random_crop=random_crop_train,
-        ),
-        num_workers=0,
-        pin_memory=True,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,  # 增加预取因子
     )
     val_loader = DataLoader(
         dataset["val"],
         batch_size=train_args["per_device_train_batch_size"],
-        collate_fn=DataCollatorWithPadding(
-            max_tokens=train_args["max_tokens_per_batch"],
-            tokenizer=tokenizer,
-            batch_by_tokens=False,
-            max_seq_len=train_args.get("max_sequence_length", None),
-            random_crop=random_crop_eval,
-        ),
-        num_workers=0,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     
     # Create test loader if test dataset exists
     test_loader = None
-    if "test" in dataset and len(dataset["test"]) > 0:
+    if "test" in dataset and dataset["test"] is not None and len(dataset["test"]) > 0:
         test_loader = DataLoader(
             dataset["test"],
             batch_size=train_args["per_device_train_batch_size"],
-            collate_fn=DataCollatorWithPadding(
-                max_tokens=train_args["max_tokens_per_batch"],
-                tokenizer=tokenizer,
-                batch_by_tokens=False,
-                max_seq_len=train_args.get("max_sequence_length", None),
-                random_crop=random_crop_eval,
-            ),
-            num_workers=0,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=True if device.type == 'cuda' else False,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
     # Ensure lr is a float (YAML may read scientific notation as string)
     lr = float(train_args["lr"]) if isinstance(train_args["lr"], str) else train_args["lr"]
@@ -977,17 +1117,21 @@ def main():
         optimizer, last_epoch=-1, init_lr=lr, on_use=False
     )
 
-    masker = Masker(tokenizer)
-    
+    # 🚀 纯 float16 训练：不使用 GradScaler（因为模型参数已经是 float16）
+    scaler = None
+    if accelerator.is_local_main_process:
+        accelerator.print(f"🔥 AMP enabled: {accelerator.mixed_precision} precision training")
+
     # Prepare test_loader if it exists
     if test_loader is not None:
-        model, optimizer, scheduler, train_loader, val_loader, test_loader = accelerator.prepare(
-            model, optimizer, scheduler, train_loader, val_loader, test_loader
+        model, optimizer, train_loader, val_loader, test_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader, test_loader
         )
     else:
-        model, optimizer, scheduler, train_loader, val_loader = accelerator.prepare(
-            model, optimizer, scheduler, train_loader, val_loader
+        model, optimizer, train_loader, val_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader
         )
+    # Note: scheduler and scaler are handled manually since accelerator may not support them
     
     # If resuming from output directory, restore optimizer and scheduler state after preparing
     if resume_from_output:
@@ -1013,7 +1157,6 @@ def main():
         optimizer=optimizer,
         scheduler=scheduler,
         tokenizer=tokenizer,
-        masker=masker,
         logger=logger,
         accelerator=accelerator,
         checkpoint_dir=output_dir,

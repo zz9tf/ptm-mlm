@@ -2,9 +2,26 @@
 
 import torch
 import torch.nn.functional as F
+import os
+import sys
 
+# Import causal_conv1d_cuda from the same directory
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
 
-import causal_conv1d_cuda
+try:
+    import causal_conv1d_cuda
+except ImportError:
+    # Try importing with explicit path
+    import importlib.util
+    so_path = os.path.join(_current_dir, 'causal_conv1d_cuda.so')
+    if os.path.exists(so_path):
+        spec = importlib.util.spec_from_file_location("causal_conv1d_cuda", so_path)
+        causal_conv1d_cuda = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(causal_conv1d_cuda)
+    else:
+        raise ImportError(f"causal_conv1d_cuda.so not found in {_current_dir}")
 
 
 class CausalConv1dFn(torch.autograd.Function):

@@ -24,7 +24,7 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Try to import both inference classes from shared inference directory
+# Try to import all inference classes from shared inference directory
 try:
     from inference import ModelInference
     MAMBA_AVAILABLE = True
@@ -36,6 +36,18 @@ try:
     ESM2_AVAILABLE = True
 except ImportError:
     ESM2_AVAILABLE = False
+
+try:
+    from inference_lora import LoRAInference
+    LORA_AVAILABLE = True
+except ImportError:
+    LORA_AVAILABLE = False
+
+try:
+    from inference_esmc import ESMCInference
+    ESMC_AVAILABLE = True
+except ImportError:
+    ESMC_AVAILABLE = False
 
 
 def load_data(data_path: str):
@@ -102,8 +114,8 @@ def main():
         "--model_type",
         type=str,
         default="mamba",
-        choices=["mamba", "esm2"],
-        help="Model type to use: 'mamba' or 'esm2' (default: mamba)"
+        choices=["mamba", "esm2", "lora", "esmc"],
+        help="Model type to use: 'mamba', 'esm2', 'lora', or 'esmc' (default: mamba)"
     )
     parser.add_argument(
         "--checkpoint", 
@@ -114,8 +126,14 @@ def main():
     parser.add_argument(
         "--esm2_model_name",
         type=str,
-        default="facebook/esm2_t33_650M_UR50D",
-        help="ESM2 model name from HuggingFace (default: facebook/esm2_t33_650M_UR50D)"
+        default="facebook/esm2_t30_150M_UR50D",
+        help="ESM2 model name from HuggingFace (default: facebook/esm2_t30_150M_UR50D for ESM-C 600)"
+    )
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=None,
+        help="Layer index to extract (1-based for esmc, 0-based for esm2). If None, uses last layer (default: None)"
     )
     parser.add_argument(
         "--train_data",
@@ -200,10 +218,25 @@ def main():
             raise ImportError("ESM2 inference not available. Please install transformers: pip install transformers")
         inferencer = ESM2Inference(
             model_name=args.esm2_model_name,
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
+    elif args.model_type == "lora":
+        if not LORA_AVAILABLE:
+            raise ImportError("LoRA inference not available. Please ensure inference_lora.py exists.")
+        inferencer = LoRAInference(
+            args.checkpoint,
             max_sequence_length=args.max_sequence_length
         )
+    elif args.model_type == "esmc":
+        if not ESMC_AVAILABLE:
+            raise ImportError("ESM-C inference not available. Please install fair-esm: pip install fair-esm")
+        inferencer = ESMCInference(
+            max_sequence_length=args.max_sequence_length,
+            layer_index=args.layer_index
+        )
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba' or 'esm2'.")
+        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba', 'esm2', 'lora', or 'esmc'.")
     
     # Process training data
     process_split(
@@ -286,14 +319,24 @@ def process_split(
         
         # Generate embeddings
         print(f"\n🔄 Generating embeddings for {len(sequences)} sequences...")
-        embeddings, lengths = inferencer.generate_per_position_embeddings(
-            sequences,
-            batch_size=batch_size,
-            max_sequence_length=max_sequence_length,
-            use_sliding_window=use_sliding_window,
-            window_overlap=window_overlap
-        )
-        
+        # LoRA 使用不同的方法名
+        if hasattr(inferencer, 'generate_per_position_block_outputs'):
+            embeddings, lengths = inferencer.generate_per_position_block_outputs(
+                sequences,
+                batch_size=batch_size,
+                max_sequence_length=max_sequence_length,
+                use_sliding_window=use_sliding_window,
+                window_overlap=window_overlap
+            )
+        else:
+            embeddings, lengths = inferencer.generate_per_position_embeddings(
+                sequences,
+                batch_size=batch_size,
+                max_sequence_length=max_sequence_length,
+                use_sliding_window=use_sliding_window,
+                window_overlap=window_overlap
+            )
+            
         # Verify embeddings match sequences
         if len(embeddings) != len(sequences):
             raise RuntimeError(f"Length mismatch: {len(embeddings)} embeddings vs {len(sequences)} sequences")

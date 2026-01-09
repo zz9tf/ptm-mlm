@@ -349,14 +349,15 @@ def get_sequence_context(ori_seq: str, position: int, context_size: int = 15) ->
     return left_context, right_context, full_context
 
 
-def load_sequence_dict(combined_file: str) -> dict:
+def load_sequence_dict(combined_file: str) -> tuple:
     """
-    Load sequences from combined.csv and create a dictionary mapping AC_ID to ori_seq.
+    Load sequences from combined.csv and create dictionaries mapping AC_ID to ori_seq and ptm_seq.
     
     @param {str} combined_file - Path to combined.csv file
-    @returns {dict} Dictionary mapping AC_ID to ori_seq
+    @returns {tuple} (sequence_dict, ptm_seq_dict) - Dictionaries mapping AC_ID to ori_seq and ptm_seq
     """
     sequence_dict = {}
+    ptm_seq_dict = {}
     print(f"📖 Loading sequences from: {combined_file}")
     
     with open(combined_file, 'r', encoding='utf-8') as f:
@@ -364,14 +365,18 @@ def load_sequence_dict(combined_file: str) -> dict:
         for row in reader:
             ac_id = row.get('AC_ID', '').strip()
             ori_seq = row.get('ori_seq', '').strip()
+            ptm_seq = row.get('ptm_seq', '').strip()
             
             if ac_id and ori_seq:
                 # If multiple sequences exist for same AC_ID, keep the first one
                 if ac_id not in sequence_dict:
                     sequence_dict[ac_id] = ori_seq
+                    if ptm_seq:
+                        ptm_seq_dict[ac_id] = ptm_seq
     
     print(f"✅ Loaded {len(sequence_dict):,} unique sequences")
-    return sequence_dict
+    print(f"✅ Loaded {len(ptm_seq_dict):,} unique ptm_seq")
+    return sequence_dict, ptm_seq_dict
 
 
 def process_ptm_data_from_source_file(
@@ -385,7 +390,7 @@ def process_ptm_data_from_source_file(
     
     Processing logic:
     1. Load all records from PTM_added_gene_symbol.csv (with all attributes)
-    2. Load sequences from combined.csv
+    2. Load sequences and ptm_seq from combined.csv
     3. Remove records without LOCATION
     4. Remove completely duplicate records
     5. For same (sequence, position, ptm_type): select most common functional_role
@@ -394,22 +399,13 @@ def process_ptm_data_from_source_file(
     @param {str} ptm_source_file - Path to PTM_added_gene_symbol.csv
     @param {str} combined_file - Path to combined.csv
     @param {str} output_file - Path to output CSV file
-    @param {int} context_size - Size of sequence context around PTM site
+    @param {int} context_size - Size of sequence context around PTM site (deprecated, kept for compatibility)
     """
     from collections import defaultdict, Counter
     
-    # Load sequences from combined.csv
+    # Load sequences and ptm_seq from combined.csv
     print("📖 Loading sequences from combined.csv...")
-    sequence_dict = {}
-    with open(combined_file, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ac_id = row.get('AC_ID', '').strip()
-            ori_seq = row.get('ori_seq', '').strip()
-            if ac_id and ori_seq:
-                if ac_id not in sequence_dict:
-                    sequence_dict[ac_id] = ori_seq
-    print(f"✅ Loaded {len(sequence_dict):,} unique sequences")
+    sequence_dict, ptm_seq_dict = load_sequence_dict(combined_file)
     
     # Load all PTM records with all attributes
     print(f"\n📖 Loading PTM data from: {ptm_source_file}")
@@ -556,30 +552,30 @@ def process_ptm_data_from_source_file(
     print(f"✅ Resolved {resolved_count:,} conflicting records")
     print(f"✅ Final unique records: {len(resolved_records):,}")
     
-    # Step 3: Process final records and extract context
-    print(f"\n📊 Processing final records and extracting context...")
+    # Step 3: Process final records and add ptm_seq
+    print(f"\n📊 Processing final records and adding ptm_seq...")
     final_sites = []
+    missing_ptm_seq_count = 0
     
     for record in resolved_records:
         # Normalize functional role
         normalized_role = normalize_functional_role(record['functional_role'])
         
-        # Get sequence context
-        left_context, right_context, full_context = get_sequence_context(
-            record['ori_seq'], record['location'], context_size
-        )
+        # Get ptm_seq from combined.csv
+        ac_id = record['uniprot_id']
+        ptm_seq = ptm_seq_dict.get(ac_id, '')
+        if not ptm_seq:
+            missing_ptm_seq_count += 1
         
         # Create final site record
         site_record = {
-            'AC_ID': record['uniprot_id'],
+            'AC_ID': ac_id,
             'ori_seq': record['ori_seq'],
+            'ptm_seq': ptm_seq,
             'position': record['location'],
             'aa': record['aa'],
             'ptm_type': record['specific_ptm_type'],
             'normalized_ptm_type': record['mod_type'],
-            'left_context': left_context,
-            'right_context': right_context,
-            'context': full_context,
             'functional_role': normalized_role,
             'pmid': record['pmid'],
             'species': record['species'],
@@ -589,6 +585,9 @@ def process_ptm_data_from_source_file(
         
         final_sites.append(site_record)
     
+    if missing_ptm_seq_count > 0:
+        print(f"⚠️  Warning: {missing_ptm_seq_count:,} records have missing ptm_seq")
+    
     # Write to output file
     if final_sites:
         # Ensure output directory exists
@@ -596,9 +595,8 @@ def process_ptm_data_from_source_file(
         
         print(f"\n💾 Saving PTM sites to: {output_file}")
         fieldnames = [
-            'AC_ID', 'ori_seq', 'position', 'aa', 'ptm_type', 'normalized_ptm_type',
-            'left_context', 'right_context', 'context', 'functional_role',
-            'pmid', 'species', 'source', 'symbol'
+            'AC_ID', 'ori_seq', 'ptm_seq', 'position', 'aa', 'ptm_type', 'normalized_ptm_type',
+            'functional_role', 'pmid', 'species', 'source', 'symbol'
         ]
         
         with open(output_file, 'w', encoding='utf-8', newline='') as f:

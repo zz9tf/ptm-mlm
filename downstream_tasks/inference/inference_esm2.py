@@ -22,7 +22,7 @@ class ESM2Inference:
     This class is shared across all downstream tasks.
     """
     
-    def __init__(self, model_name: str = "facebook/esm2_t33_650M_UR50D", device: str = None, max_sequence_length: int = None):
+    def __init__(self, model_name: str = "facebook/esm2_t33_650M_UR50D", device: str = None, max_sequence_length: int = None, layer_index: int = None):
         """
         Initialize the ESM2 inference model.
         
@@ -30,6 +30,8 @@ class ESM2Inference:
         @param device: Device to run inference on (None for auto-detect)
         @param max_sequence_length: Maximum sequence length for tokenization. 
                                    ESM2 has a max of 1024 tokens by default.
+        @param layer_index: Index of layer to extract (0-based). If None, uses last_hidden_state (default: None)
+                           For ESM-C 600 layer 30, use layer_index=29 (0-based indexing)
         """
         if not ESM2_AVAILABLE:
             raise ImportError("transformers library is required for ESM2. Install with: pip install transformers")
@@ -49,6 +51,14 @@ class ESM2Inference:
         
         # Get hidden size from model config
         self.hidden_size = self.model.config.hidden_size
+        
+        # Set layer index for extraction
+        self.layer_index = layer_index
+        if layer_index is not None:
+            num_layers = getattr(self.model.config, 'num_hidden_layers', None)
+            if num_layers is not None and layer_index >= num_layers:
+                raise ValueError(f"layer_index {layer_index} is out of range. Model has {num_layers} layers (0-{num_layers-1})")
+            print(f"🔍 Will extract embeddings from layer {layer_index} (0-based)")
         
         # Set max sequence length (ESM2 default is 1024, but can be adjusted)
         if max_sequence_length is None:
@@ -88,8 +98,16 @@ class ESM2Inference:
         attention_mask = encoded['attention_mask'].to(self.device)
         
         # Generate embeddings
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+        # If layer_index is specified, output all hidden states to extract specific layer
+        if self.layer_index is not None:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            # Extract hidden states from all layers: outputs.hidden_states is a tuple of [batch_size, seq_len, hidden_size]
+            # Layer 0 is embedding layer, layer 1 to num_layers are transformer layers
+            # For ESM-C 600 layer 30, we want layer_index=29 (0-based), which corresponds to hidden_states[30] (1-based)
+            hidden_states = outputs.hidden_states[self.layer_index + 1]  # +1 because hidden_states[0] is embedding layer
+        else:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
         
         return hidden_states, attention_mask
     

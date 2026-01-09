@@ -94,7 +94,7 @@ def get_esm_embed_dim(model_name: str, repr_layer: Optional[int] = None) -> int:
         "esm2_15b": 5120,
         "esm3_7b": 2560,  # ESM3 7B typically has 2560 dimensions
         "esmc_300m": 640,  # ESM C 300M typically has 640 dimensions
-        "esmc_600m": 640,  # ESM C 600M typically has 640 dimensions
+        "esmc_600m": 1152,  # ESM C 600M has 1152 dimensions (not 640!)
     }
     
     # Return known dimension (fast, no model loading needed)

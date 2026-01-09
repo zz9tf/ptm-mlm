@@ -6,47 +6,60 @@ exp_name: ptm-mamba
 # Random seed
 seed: 42
 
-# Reporting/logging backend
+# Reporting/logging backend (e.g., ["wandb"] for Weights & Biases)
 report_to: []
+
+preprocess:
+  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/processing_data/functional_role/ptm_sites_with_functional_role.csv"
 
 # Dataset configuration
 dataset:
-  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/mamba.csv"
+  # CSV file path for embedding generation
+  # ESM input uses --original_sequence_column when --use_original_sequence is set
   sequence_column_name: "ptm_seq"
+  dataset_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/embeddings"
+  preload_all: false
+  use_functional_role: false  # Whether to use functional role data (requires functional_role.dat and functional_role_position.dat files)
+
+  # Number of samples for validation set
   val_size: 10000
+  # Number of samples for test set
   test_size: 5000
-  split: true
-  subsample_size: null
-  split_seed: 42
-  max_sequence_length: null
 
 # Training arguments
 training:
-  resume_from_output: null  # Path to output directory to resume training from (e.g., "outputs/ptm-mamba-2025-12-22-15-01-34"). Always loads from last.ckpt
-  use_esm: false # or true
-  esm_model: "esm2_15b"  # ESM model to use: "esm2_650m" (ESM2 650M), "esm2_15b" (ESM2 15B), "esm3_7b" (ESM3 7B), or "esmc_300m" (ESM C 300M). Only used when use_esm is true
-  repr_layer: null  # Representation layer index to extract embeddings from. If null, uses model default (last layer). Only used for embedding generation.
-  # Use pre-computed embeddings (set to true and provide embeddings_dir to use pre-generated embeddings)
-  use_precomputed_embeddings: false
-  embeddings_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/embeddings"  # Path to directory containing train_embeddings.json, val_embeddings.json, test_embeddings.json
+  # Resume training from checkpoint
+  resume_from_output: null  # Path to output directory to resume from (e.g., "outputs/ptm-mamba-2025-12-22-15-01-34"). Always loads from last.ckpt
+  
+  # ESM model configuration (for auto-detecting embedding dimension)
+  esm_model: "esmc_600m"  # ESM model name: "esm2_650m", "esm2_15b", "esm3_7b", "esmc_300m", "esmc_600m"
+  repr_layer: 30  # Representation layer index (null = use model default/last layer). Only used for embedding dimension detection.
+  
+  # Training hyperparameters
   num_train_epochs: 100
-  log_steps: 1000
-  sort_by_seq: false
-  sample_len_ascending: true
-  per_device_train_batch_size: 96 # or 8
-  max_tokens_per_batch: 100000
-  max_sequence_length: 512
-  lr: 4e-4
+  log_steps: 1000  # Log metrics every N steps
+  per_device_train_batch_size: 96
+  lr: 4e-4  # Learning rate
+  max_sequence_length: 512  # Maximum sequence length for embedding generation (sequences longer than this will be split into windows)
 
 # Model configuration
 model:
-  model_type: "bidirectional_mamba"
-  d_model: 512
-  n_layer: 12
-  vocab_size: 50277  # Will be auto-set by tokenizer, 50277 for original Mamba
-  rms_norm: true
-  residual_in_fp32: true
-  fused_add_norm: true
-  pad_vocab_size_multiple: 8
-  ssm_cfg: {}
+  # Model architecture
+  d_model: 512  # Model dimension for intermediate processing
+  
+  # Block configuration (processes embeddings)
+  block_config:
+    type: "lora"  # Block type: "lora"
+    rank: 8  # LoRA rank
+    alpha: 32  # LoRA alpha
+    dropout: 0.1  # Dropout rate
+  
+  # Heads configuration (generate sequences)
+  heads_config:
+    - type: "original"  # Head type: "original" or "ptm" or "functional_role"
+      weight: 1.0  # Loss weight (optional, default: 1.0)
+    - type: "ptm"  # Head type: "original" or "ptm" or "functional_role"
+      weight: 1.0  # Loss weight (optional, default: 1.0)
+    - type: "functional_role"  # Head type: "functional_role" for functional role prediction
+      weight: 1.0  # Loss weight (optional, default: 1.0)
 

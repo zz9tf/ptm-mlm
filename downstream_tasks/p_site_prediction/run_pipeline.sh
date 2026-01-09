@@ -3,25 +3,25 @@
 # 磷酸化位点预测完整流程脚本
 
 source /home/zz/miniconda3/etc/profile.d/conda.sh
-conda activate ptm-mamba
+conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 set -e  # Exit on error
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="4"
 
 # ============================================
 # 配置参数 (Configuration)
 # ============================================
 WORK_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction"
-CHECKPOINT="${WORK_DIR}/../checkpoints/esm_650m_mamba.ckpt"  # 预训练模型checkpoint路径
+CHECKPOINT="${WORK_DIR}/../checkpoints/LoRA_fast.ckpt"  # LoRA模型checkpoint路径
 TRAIN_DATA="${WORK_DIR}/PhosphositePTM.train.txt"
 TEST_DATA="${WORK_DIR}/PhosphositePTM.test.txt"
 VALID_DATA="${WORK_DIR}/PhosphositePTM.valid.txt"  # 可选
 BASE_OUTPUT_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs"  # 基础输出目录
 # 创建带日期的输出目录
 DATE_STR=$(date +"%Y-%m-%d")
-OUTPUT_DIR="${BASE_OUTPUT_DIR}/p_site_prediction_esm_650m_${DATE_STR}"
-BATCH_SIZE=64
+OUTPUT_DIR="${BASE_OUTPUT_DIR}/p_site_prediction_esmc600_lastlayer_${DATE_STR}"
+BATCH_SIZE=512
 NUM_EPOCHS=10
 LEARNING_RATE=1e-4
 DEVICE="cuda"  # 或 "cpu"
@@ -29,11 +29,7 @@ LAMBDA_WEIGHT=0.5  # Weight (λ) for AUCMLoss in combined loss: loss = bce_loss 
 MAX_SEQUENCE_LENGTH=512  # 滑动窗口大小(默认512，与训练配置一致)
 WINDOW_OVERLAP=0.3  # 滑动窗口重叠比例(0.3表示30%重叠)
 USE_SLIDING_WINDOW=true  # 使用滑动窗口处理长序列(推荐，确保所有位置都被处理)
-MODEL_TYPE="mamba"  # 模型类型: "mamba" 或 "esm2"
-ESM2_MODEL_NAME="facebook/esm2_t33_650M_UR50D"  # ESM2模型名称(仅在MODEL_TYPE="esm2"时使用) esm2_t33_650M_UR50D esm2_t48_15B_UR50D
-USE_ESM=true  # 是否加载ESM2-15B模型(仅在MODEL_TYPE="mamba"时有效)
-                # true: 使用Mamba+ESM2-15B组合(自动加载esm2_t48_15B_UR50D，匹配训练时的配置)
-                # false: 只使用Mamba模型(不加载ESM，节省内存)
+MODEL_TYPE="esmc"  # 模型类型: "mamba", "esm2", "lora", 或 "esmc"
 
 # 创建输出目录
 mkdir -p "${OUTPUT_DIR}"
@@ -49,8 +45,6 @@ echo "============================================"
 
 python generate_embeddings.py \
     --model_type "${MODEL_TYPE}" \
-    --checkpoint "${CHECKPOINT}" \
-    --esm2_model_name "${ESM2_MODEL_NAME}" \
     --train_data "${TRAIN_DATA}" \
     --test_data "${TEST_DATA}" \
     --valid_data "${VALID_DATA}" \
@@ -58,8 +52,7 @@ python generate_embeddings.py \
     --batch_size ${BATCH_SIZE} \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
     --window_overlap ${WINDOW_OVERLAP} \
-    $([ "${USE_SLIDING_WINDOW}" = "true" ] && echo "--use_sliding_window" || echo "") \
-    $([ "${USE_ESM}" = "true" ] && echo "--use_esm" || echo "")
+    $([ "${USE_SLIDING_WINDOW}" = "true" ] && echo "--use_sliding_window" || echo "")
 
 echo "✅ Step 1 完成: Embeddings已生成"
 echo ""

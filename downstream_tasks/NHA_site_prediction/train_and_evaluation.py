@@ -679,6 +679,19 @@ def train_single_length_group(
             'note': 'Final model saved without validation metrics',
             'sequence_length': seq_length
         }, best_model_path)
+    # If validation set exists but model was never saved (F1 never > 0.0), save the final model
+    elif not os.path.exists(best_model_path):
+        print(f"⚠️  Model was never saved during training (best F1: {best_f1:.4f}). Saving final model...")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'input_dim': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers,
+            'epoch': args.num_epochs - 1,
+            'note': f'Final model saved (validation F1 never exceeded 0.0, best was {best_f1:.4f})',
+            'sequence_length': seq_length,
+            'valid_metrics': training_history.get('valid_f1', [None])[-1] if training_history.get('valid_f1') else None
+        }, best_model_path)
     
     # Save training history
     history_path = os.path.join(length_output_dir, "training_history.json")
@@ -1351,6 +1364,19 @@ def main():
             'num_layers': num_layers,
             'epoch': args.num_epochs - 1,
             'note': 'Final model saved without validation metrics'
+        }, best_model_path)
+        print(f"💾 Final model saved to {best_model_path}")
+    # If validation set exists but model was never saved (F1 never > 0.0), save the final model
+    elif not os.path.exists(best_model_path):
+        print(f"\n⚠️  Model was never saved during training (best F1: {best_f1:.4f}). Saving final model...")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'input_dim': args.hidden_size,
+            'hidden_dim': hidden_dim,
+            'num_layers': num_layers,
+            'epoch': args.num_epochs - 1,
+            'note': f'Final model saved (validation F1 never exceeded 0.0, best was {best_f1:.4f})',
+            'valid_metrics': training_history.get('valid_f1', [None])[-1] if training_history.get('valid_f1') else None
         }, best_model_path)
         print(f"💾 Final model saved to {best_model_path}")
     
