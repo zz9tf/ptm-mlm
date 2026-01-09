@@ -15,6 +15,7 @@ from models.block import (
 from models.head import (
     OriginalHead,
     PTMHead,
+    FunctionalRoleHead,
     build_head,
     HEAD_REGISTRY,
 )
@@ -28,6 +29,7 @@ __all__ = [
     # Heads
     "OriginalHead",
     "PTMHead",
+    "FunctionalRoleHead",
     "build_head",
     "HEAD_REGISTRY",
     # Main model

@@ -7,21 +7,21 @@ conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 set -e  # Exit on error
-export CUDA_VISIBLE_DEVICES="4"
+export CUDA_VISIBLE_DEVICES="0"
 
 # ============================================
 # 配置参数 (Configuration)
 # ============================================
 WORK_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction"
-CHECKPOINT="${WORK_DIR}/../checkpoints/LoRA_fast.ckpt"  # LoRA模型checkpoint路径
+CHECKPOINT="/home/zz/zheng/ptm-mlm/downstream_tasks/checkpoints/LoRA_combine_ptm.ckpt"  # LoRA模型checkpoint路径
 TRAIN_DATA="${WORK_DIR}/PhosphositePTM.train.txt"
 TEST_DATA="${WORK_DIR}/PhosphositePTM.test.txt"
 VALID_DATA="${WORK_DIR}/PhosphositePTM.valid.txt"  # 可选
 BASE_OUTPUT_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs"  # 基础输出目录
 # 创建带日期的输出目录
 DATE_STR=$(date +"%Y-%m-%d")
-OUTPUT_DIR="${BASE_OUTPUT_DIR}/p_site_prediction_esmc600_lastlayer_${DATE_STR}"
-BATCH_SIZE=512
+OUTPUT_DIR="${BASE_OUTPUT_DIR}/p_site_prediction_lora_combine_ptm_${DATE_STR}"
+BATCH_SIZE=64
 NUM_EPOCHS=10
 LEARNING_RATE=1e-4
 DEVICE="cuda"  # 或 "cpu"
@@ -52,6 +52,7 @@ python generate_embeddings.py \
     --batch_size ${BATCH_SIZE} \
     --max_sequence_length ${MAX_SEQUENCE_LENGTH} \
     --window_overlap ${WINDOW_OVERLAP} \
+    --layer_index 30 \
     $([ "${USE_SLIDING_WINDOW}" = "true" ] && echo "--use_sliding_window" || echo "")
 
 echo "✅ Step 1 完成: Embeddings已生成"

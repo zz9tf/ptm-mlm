@@ -119,7 +119,7 @@ class PTMDatasetMemmap(TorchDataset):
             ]
 
             # 如果使用functional role，添加相关文件
-            if self.use_functional_role:
+            if getattr(self, 'use_functional_role', False):
                 files_to_load.extend([
                     {
                         "name": "functional_role.dat",
@@ -272,7 +272,7 @@ class PTMDatasetMemmap(TorchDataset):
             )
 
             # 如果使用functional role，加载相关memmap文件
-            if self.use_functional_role:
+            if getattr(self, 'use_functional_role', False):
                 self.functional_role_memmap = np.memmap(
                     os.path.join(self.dataset_dir, "functional_role.dat"),
                     dtype=np.float32,
@@ -305,6 +305,21 @@ class PTMDatasetMemmap(TorchDataset):
 
         # 扁平化索引以优化 __len__ 和 __getitem__ 性能
         self._build_flat_index()
+
+    def __getstate__(self):
+        """自定义序列化以确保所有必要属性都被包含"""
+        state = self.__dict__.copy()
+        # 确保关键属性存在
+        if 'use_functional_role' not in state:
+            state['use_functional_role'] = False
+        return state
+
+    def __setstate__(self, state):
+        """自定义反序列化"""
+        self.__dict__.update(state)
+        # 确保关键属性存在
+        if not hasattr(self, 'use_functional_role'):
+            self.use_functional_role = False
 
     def _build_samples(self):
         """
@@ -439,7 +454,7 @@ class PTMDatasetMemmap(TorchDataset):
             protein_idx = int(self.meta_id_data[sample_idx])
 
             # 如果使用functional role，读取相关数据
-            if self.use_functional_role:
+            if getattr(self, 'use_functional_role', False):
                 functional_role = self.functional_role_data[sample_idx]  # (512,) float32
                 functional_role_position = self.functional_role_position_data[sample_idx]  # (512,) int32
         else:
@@ -451,7 +466,7 @@ class PTMDatasetMemmap(TorchDataset):
             protein_idx = int(self.meta_id_memmap[sample_idx])
 
             # 如果使用functional role，读取相关数据
-            if self.use_functional_role:
+            if getattr(self, 'use_functional_role', False):
                 functional_role = self.functional_role_memmap[sample_idx]  # (512,) float32
                 functional_role_position = self.functional_role_position_memmap[sample_idx]  # (512,) int32
         
@@ -476,7 +491,7 @@ class PTMDatasetMemmap(TorchDataset):
         }
 
         # 如果使用functional role，添加相关数据
-        if self.use_functional_role:
+        if getattr(self, 'use_functional_role', False):
             result["functional_role"] = functional_role  # np.ndarray[float32]，functional role 值
             result["functional_role_position"] = functional_role_position  # np.ndarray[int32]，functional role 位置
 
@@ -513,7 +528,7 @@ class PTMDatasetMemmap(TorchDataset):
                 dataset.meta_id_data = self.meta_id_data
 
                 # 如果使用functional role，共享相关数据
-                if self.use_functional_role:
+                if getattr(self, 'use_functional_role', False):
                     dataset.functional_role_data = self.functional_role_data
                     dataset.functional_role_position_data = self.functional_role_position_data
             else:
@@ -525,7 +540,7 @@ class PTMDatasetMemmap(TorchDataset):
                 dataset.meta_id_memmap = self.meta_id_memmap
 
                 # 如果使用functional role，共享相关memmap
-                if self.use_functional_role:
+                if getattr(self, 'use_functional_role', False):
                     dataset.functional_role_memmap = self.functional_role_memmap
                     dataset.functional_role_position_memmap = self.functional_role_position_memmap
             

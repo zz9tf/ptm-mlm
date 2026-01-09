@@ -6,6 +6,7 @@ Each head is in a separate file for clarity.
 
 from models.head.original import OriginalHead
 from models.head.ptm import PTMHead
+from models.head.functional_role import FunctionalRoleHead
 from typing import Dict, Any
 
 
@@ -13,6 +14,7 @@ from typing import Dict, Any
 HEAD_REGISTRY = {
     "original": OriginalHead,
     "ptm": PTMHead,
+    "functional_role": FunctionalRoleHead,
 }
 
 
@@ -57,6 +59,7 @@ def build_head(head_cfg: Dict[str, Any], d_model: int, vocab_size: int):
 __all__ = [
     "OriginalHead",
     "PTMHead",
+    "FunctionalRoleHead",
     "build_head",
     "HEAD_REGISTRY",
 ]

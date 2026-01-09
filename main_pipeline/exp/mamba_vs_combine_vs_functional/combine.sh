@@ -6,12 +6,13 @@ conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 # Set GPU (use GPU 0)
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="4"
 
 # Run training with config overrides
 python train.py \
     --config configs/base.yaml \
     exp_name=combine \
+    dataset.preload_all=true \
     dataset.dataset_dir=/home/zz/zheng/ptm-mlm/main_pipeline/memmap_combined \
     model.d_model=1024 \
     training.num_train_epochs=40 \

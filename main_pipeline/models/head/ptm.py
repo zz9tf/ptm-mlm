@@ -51,24 +51,21 @@ class PTMHead(nn.Module):
         logits: torch.Tensor,
         input_ids: torch.Tensor,
         device: torch.device,
-        ptm_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
-        Compute loss at PTM site positions.
-        
+        Compute loss at all positions (including non-PTM positions that should predict <not-PTM>).
+
         @param logits: Head output logits of shape (batch_size, seq_len, vocab_size)
         @param input_ids: Target token IDs of shape (batch_size, seq_len)
         @param device: Device for tensor operations
-        @param ptm_mask: Boolean mask of shape (batch_size, seq_len) indicating PTM token positions
         @param **kwargs: Additional arguments (unused)
         @returns: Scalar loss tensor
         """
-        if ptm_mask is not None and ptm_mask.any():
-            return F.cross_entropy(
-                logits[ptm_mask],
-                input_ids[ptm_mask],
-            )
-        else:
-            return torch.tensor(0.0, device=device)
+        # Compute loss at all positions, including padding positions (will be masked by pad_mask in training)
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            input_ids.view(-1),
+            reduction='mean'
+        )
 

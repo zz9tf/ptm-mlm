@@ -12,6 +12,7 @@ export CUDA_VISIBLE_DEVICES="5"
 python train.py \
     --config configs/base.yaml \
     exp_name=functional \
+    dataset.preload_all=true \
     dataset.dataset_dir=/home/zz/zheng/ptm-mlm/main_pipeline/memmap_functional \
     model.d_model=1024 \
     training.num_train_epochs=40 \

@@ -9,8 +9,8 @@ from typing import Any, Dict
 
 class FunctionalRoleHead(nn.Module):
     """
-    Head for predicting functional role at PTM positions.
-    Uses BCE loss for binary classification.
+    Head for predicting functional role at PTM positions in protein sequences.
+    Uses BCE loss for binary classification at labeled positions only.
     """
     
     def __init__(self, d_model: int, output_size: int = 1, device=None, dtype=None, **kwargs):
@@ -37,31 +37,36 @@ class FunctionalRoleHead(nn.Module):
         else:
             raise ValueError(f"Invalid mix_type: {self.mix_type}")
     
-    def forward(self, features: torch.Tensor, processed: Dict[str, Any], **kwargs) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, processed: Dict[str, Any], position_mask: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
         """
-        Predict functional role at PTM positions.
+        Predict functional role using pooled features from PTM positions.
 
         @param features: Processed features of shape (batch_size, seq_len, d_model)
         @param processed: Dictionary of processed features from previous heads
-        @param **kwargs: Additional arguments, must include ptm_position
-        @returns: Logits of shape (batch_size, seq_len, output_size)
+        @param position_mask: Boolean mask indicating PTM positions (batch_size, seq_len)
+        @param **kwargs: Additional arguments
+        @returns: Dictionary containing logits of shape (batch_size, output_size)
         """
         processed_features = processed.get("ptm_features", None)
         if processed_features is None:
             raise ValueError("ptm_features must be provided")
 
-        # Get ptm_position from kwargs
-        ptm_position = kwargs.get("ptm_position", None)
-        if ptm_position is None:
-            raise ValueError("ptm_position must be provided")
+        # Extract features at PTM positions
+        masked_features = features[position_mask]  # (num_masked_positions, d_model)
+        masked_ptm_features = processed_features[position_mask]  # (num_masked_positions, d_model)
+
         if self.mix_type == "concat":
-            features = torch.cat([features[:, ptm_position, :], processed_features[:, ptm_position, :]], dim=-1)
+            combined_features = torch.cat([masked_features, masked_ptm_features], dim=-1)
         elif self.mix_type == "gate":
-            gate = torch.sigmoid(self.gate_layer(torch.cat([features[:, ptm_position, :], processed_features[:, ptm_position, :]], dim=-1)))
-            features = features[:, ptm_position, :] * gate + processed_features[:, ptm_position, :] * (1 - gate)
+            gate_input = torch.cat([masked_features, masked_ptm_features], dim=-1)
+            gate = torch.sigmoid(self.gate_layer(gate_input))
+            combined_features = masked_features * gate + masked_ptm_features * (1 - gate)
+
+        # Compute logits for masked positions
+        logits = self.head(combined_features)  # (num_masked_positions, output_size)
 
         return {
-            "logits": self.head(features)
+            "logits": logits
         }
     
     def compute_loss(
@@ -74,27 +79,17 @@ class FunctionalRoleHead(nn.Module):
         """
         Compute BCE loss for functional role prediction.
 
-        @param logits: Head output logits of shape (batch_size, seq_len, output_size)
-        @param targets: Target values of shape (batch_size, seq_len) - binary labels
+        @param logits: Head output logits of shape (batch_size, 1) - already masked in forward
+        @param targets: Target values of shape (batch_size, 1) - binary labels (0/1)
         @param device: Device for tensor operations
-        @param **kwargs: Additional arguments, may include functional_role_mask
+        @param **kwargs: Additional arguments
         @returns: Scalar loss tensor
         """
-        # Get mask for positions where functional role should be predicted
-        functional_role_mask = kwargs.get("functional_role_mask", None)
-        if functional_role_mask is None:
-            # Default: predict at all positions
-            functional_role_mask = torch.ones_like(targets, dtype=torch.bool)
-
-        # Only compute loss at masked positions
-        if functional_role_mask.any():
-            # For binary classification, squeeze the last dimension if output_size == 1
-            if logits.shape[-1] == 1:
-                logits = logits.squeeze(-1)
-            return F.binary_cross_entropy_with_logits(
-                logits[functional_role_mask],
-                targets[functional_role_mask].float()
-            )
-        else:
+        if targets.numel() == 0 or logits.numel() == 0:
             return torch.tensor(0.0, device=device)
+
+        return F.binary_cross_entropy_with_logits(
+            logits.squeeze(-1),  # (batch_size,)
+            targets.squeeze(-1).float()  # (batch_size,)
+        )
 

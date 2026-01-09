@@ -189,6 +189,7 @@ class PTMTokenizer(Tokenizer):
             "<4-aspartylphosphate>",
             "<S-geranylgeranyl cysteine>",
             "<4-carboxyglutamate>",
+            "<not-PTM>",
         ]
         super().__init__(tokens, unk_token_id=3)
         self.ptm_token_start = self.ids_to_tokens.index("PTM")

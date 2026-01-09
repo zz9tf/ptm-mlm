@@ -60,6 +60,4 @@ model:
       weight: 1.0  # Loss weight (optional, default: 1.0)
     - type: "ptm"  # Head type: "original" or "ptm" or "functional_role"
       weight: 1.0  # Loss weight (optional, default: 1.0)
-    - type: "functional_role"  # Head type: "functional_role" for functional role prediction
-      weight: 1.0  # Loss weight (optional, default: 1.0)
 

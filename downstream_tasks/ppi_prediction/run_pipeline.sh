@@ -7,18 +7,18 @@ conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 set -e  # Exit on error
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="2"
 
 # ============================================
 # 配置参数 (Configuration)
 # ============================================
 WORK_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/ppi_prediction"
-CHECKPOINT="${WORK_DIR}/../checkpoints/LoRA_fast.ckpt"  # LoRA模型checkpoint路径
+CHECKPOINT="${WORK_DIR}/../checkpoints/LoRA_combine_ptm.ckpt"  # LoRA模型checkpoint路径
 DATA="${WORK_DIR}/PTM experimental evidence.csv"  # PPI数据文件
 BASE_OUTPUT_DIR="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs"  # 基础输出目录
 # 创建带日期的输出目录
 DATE_STR=$(date +"%Y-%m-%d")
-OUTPUT_DIR="${BASE_OUTPUT_DIR}/ppi_prediction_esmc600_lastlayer_${DATE_STR}"
+OUTPUT_DIR="${BASE_OUTPUT_DIR}/ppi_prediction_lora_combine_ptm_${DATE_STR}"
 BATCH_SIZE=512
 NUM_EPOCHS=50
 LEARNING_RATE=1e-4

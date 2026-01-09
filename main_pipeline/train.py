@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import yaml
 import argparse
 from transformers.trainer import DataLoader
@@ -238,6 +239,10 @@ def train(
             pad_mask = batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             original_input_ids = batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             ptm_input_ids = batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            if "position_mask" in batch:
+                position_mask = batch["position_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            else:
+                position_mask = None
 
             # Get functional role data if available
             functional_role = batch.get("functional_role", None)
@@ -245,13 +250,10 @@ def train(
             if functional_role is not None:
                 functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
                 functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
-
-            # Get PTM mask (positions where tokens are PTM tokens)
-            ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
             
             # 🚀 纯 FP16: 直接前向传播 (模型参数已经是 float16)
             # Forward pass through model
-            outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor] - {head_name: logits}
+            outputs = model(embeddings=embeddings, position_mask=position_mask)  # Dict[str, torch.Tensor] - {head_name: logits}
 
             # Get the actual model (handle accelerator wrapping)
             actual_model = model.module if hasattr(model, 'module') else model
@@ -261,14 +263,16 @@ def train(
             for head_type, logits in outputs.items():
                 loss_compute_related = {
                     "logits": logits,
-                    "target": original_input_ids if head_type == "original" else ptm_input_ids,
                     "kwargs": {
                         "device": device,
                     }
                 }
-                # Add ptm_mask for PTM head
-                if head_type == "ptm":
-                    loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
+                if head_type == "original":
+                    loss_compute_related["target"] = original_input_ids
+                elif head_type == "ptm":
+                    loss_compute_related["target"] = ptm_input_ids
+                elif head_type == "functional_role":
+                    loss_compute_related["target"] = functional_role
 
                 losses_compute_related[head_type] = loss_compute_related
 
@@ -276,25 +280,6 @@ def train(
             losses = actual_model.compute_loss(losses_compute_related)
             total_loss = losses["total"]
 
-            # Add functional role BCE loss if available
-            if functional_role is not None and "functional_role" in outputs:
-                # TODO: 用户需要细化具体的functional role loss计算方式
-                # 目前使用基本的BCE loss作为占位符
-                functional_role_logits = outputs["functional_role"]  # (batch_size, max_seq_len, 1) or similar
-                # 计算functional role位置的BCE loss
-                functional_role_mask = (functional_role_position > 0)  # 假设>0表示有functional role
-                if functional_role_mask.any():
-                    # 将logits squeeze到最后一维并计算BCE
-                    fr_logits = functional_role_logits.squeeze(-1)  # (batch_size, max_seq_len)
-                    fr_loss = F.binary_cross_entropy_with_logits(
-                        fr_logits[functional_role_mask],
-                        functional_role[functional_role_mask]
-                    )
-                    # 将functional role loss加到总loss中 (可以调整权重)
-                    functional_role_weight = 1.0  # TODO: 可以从config中读取
-                    total_loss = total_loss + functional_role_weight * fr_loss
-                    losses["functional_role"] = fr_loss
-            
             # Compute accuracy for each head
             head_accs = {}
             for head_type, logits in outputs.items():
@@ -307,10 +292,7 @@ def train(
                         acc = torch.tensor(0.0, device=device)
                 elif head_type == "ptm":
                     # Accuracy at PTM positions only
-                    if ptm_mask.any():
-                        acc = (logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
-                    else:
-                        acc = torch.tensor(0.0, device=device)
+                    acc = (logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                 else:
                     acc = torch.tensor(0.0, device=device)
                 head_accs[head_type] = acc
@@ -378,7 +360,7 @@ def train(
             
             # Clean up batch variables after logging
             del outputs, losses_compute_related, losses, head_accs, preplexity, acc, ptm_acc, total_loss
-            del embeddings, pad_mask, original_input_ids, ptm_input_ids, ptm_mask
+            del embeddings, pad_mask, original_input_ids, ptm_input_ids
             
             # Removed frequent empty_cache() calls - only clear at epoch/validation end
             
@@ -414,8 +396,6 @@ def train(
                             functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
                             functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
 
-                        # Get PTM mask
-                        ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
                         
                         # 🚀 纯 FP16: 验证前向传播
                         # Forward pass through model
@@ -429,36 +409,22 @@ def train(
                         for head_type, logits in outputs.items():
                             loss_compute_related = {
                                 "logits": logits,
-                                "target": original_input_ids if head_type == "original" else ptm_input_ids,
                                 "kwargs": {
                                     "device": device,
                                 }
                             }
-                            # Add ptm_mask for PTM head
-                            if head_type == "ptm":
-                                loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
-
+                            if head_type == "original":
+                                loss_compute_related["target"] = original_input_ids
+                            elif head_type == "ptm":
+                                loss_compute_related["target"] = ptm_input_ids
+                            elif head_type == "functional_role":
+                                loss_compute_related["target"] = functional_role
                             losses_compute_related[head_type] = loss_compute_related
 
                         # Compute losses using model's compute_loss method
                         losses = actual_model.compute_loss(losses_compute_related)
                         loss = losses["total"]
 
-                        # Add functional role BCE loss if available
-                        if functional_role is not None and "functional_role" in outputs:
-                            # TODO: 用户需要细化具体的functional role loss计算方式
-                            functional_role_logits = outputs["functional_role"]
-                            functional_role_mask = (functional_role_position > 0)
-                            if functional_role_mask.any():
-                                fr_logits = functional_role_logits.squeeze(-1)
-                                fr_loss = F.binary_cross_entropy_with_logits(
-                                    fr_logits[functional_role_mask],
-                                    functional_role[functional_role_mask]
-                                )
-                                # 将functional role loss加到总loss中
-                                functional_role_weight = 1.0  # TODO: 可以从config中读取
-                                loss = loss + functional_role_weight * fr_loss
-                        
                         # Compute accuracy for each head
                         original_logits = outputs.get("original", None)
                         ptm_logits = outputs.get("ptm", None)
@@ -471,8 +437,8 @@ def train(
                             acc = torch.tensor(0.0, device=device)
                         
                         # Compute PTM accuracy on ptm at PTM sites
-                        if ptm_mask.any() and ptm_logits is not None:
-                            ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
+                        if ptm_logits is not None:
+                            ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                         else:
                             ptm_acc = torch.tensor(0.0, device=device)
                     
@@ -505,7 +471,7 @@ def train(
                         )
                     
                     # Clean up validation batch variables
-                    del embeddings, pad_mask, original_input_ids, ptm_input_ids, ptm_mask
+                    del embeddings, pad_mask, original_input_ids, ptm_input_ids
                     del outputs, losses_compute_related, losses, original_logits, ptm_logits
                     del acc, ptm_acc, preplexity, loss, non_padding_mask
                 
@@ -635,9 +601,6 @@ def train(
                     if functional_role is not None:
                         functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
                         functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
-
-                    # Get PTM mask
-                    ptm_mask = tokenizer.is_ptm_token(ptm_input_ids).to(device)
                     
                     # 🚀 纯 FP16: 测试前向传播
                     # Forward pass through model
@@ -651,14 +614,16 @@ def train(
                     for head_type, logits in outputs.items():
                         loss_compute_related = {
                             "logits": logits,
-                            "target": original_input_ids if head_type == "original" else ptm_input_ids,
                             "kwargs": {
                                 "device": device,
                             }
                         }
-                        # Add ptm_mask for PTM head
-                        if head_type == "ptm":
-                            loss_compute_related["kwargs"]["ptm_mask"] = ptm_mask
+                        if head_type == "original":
+                            loss_compute_related["target"] = original_input_ids
+                        elif head_type == "ptm":
+                            loss_compute_related["target"] = ptm_input_ids
+                        elif head_type == "functional_role":
+                            loss_compute_related["target"] = functional_role
 
                         losses_compute_related[head_type] = loss_compute_related
 
@@ -666,20 +631,6 @@ def train(
                     losses = actual_model.compute_loss(losses_compute_related)
                     loss = losses["total"]
 
-                    # Add functional role BCE loss if available
-                    if functional_role is not None and "functional_role" in outputs:
-                        # TODO: 用户需要细化具体的functional role loss计算方式
-                        functional_role_logits = outputs["functional_role"]
-                        functional_role_mask = (functional_role_position > 0)
-                        if functional_role_mask.any():
-                            fr_logits = functional_role_logits.squeeze(-1)
-                            fr_loss = F.binary_cross_entropy_with_logits(
-                                fr_logits[functional_role_mask],
-                                functional_role[functional_role_mask]
-                            )
-                            # 将functional role loss加到总loss中
-                            functional_role_weight = 1.0  # TODO: 可以从config中读取
-                            loss = loss + functional_role_weight * fr_loss
                     
                     # Compute accuracy for each head
                     original_logits = outputs.get("original", None)
@@ -693,10 +644,7 @@ def train(
                         acc = torch.tensor(0.0, device=device)
                     
                     # Compute PTM accuracy on ptm at PTM sites
-                    if ptm_mask.any() and ptm_logits is not None:
-                        ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids)[ptm_mask].float().mean()
-                    else:
-                        ptm_acc = torch.tensor(0.0, device=device)
+                    acc = (logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                 
                 # compute perplexity
                 preplexity = torch.exp(loss)
@@ -1020,7 +968,6 @@ def main():
         2. 批量创建 pad_mask 和输入 tensors
         3. 移除字符串对象以提高性能
         """
-        batch_size = len(batch)
         max_seq_len = batch[0]["embeddings"].shape[0]  # 所有样本都有相同形状
 
         # 批量堆叠 embeddings（保持 float16 CPU tensor）
@@ -1039,7 +986,14 @@ def main():
 
         # 使用 torch.stack 而不是逐个 from_numpy（更高效）
         original_input_ids = torch.stack([torch.from_numpy(ids) for ids in orig_ids_list]).long()
-        ptm_input_ids = torch.stack([torch.from_numpy(ids) for ids in ptm_ids_list]).long()
+        ptm_input_ids = []
+        for ids in ptm_ids_list:
+            # 复制数组以确保可写（memmap 数组可能是只读的）
+            ids_copy = ids.copy()
+            mask = ~tokenizer.is_ptm_token(ids_copy)
+            ids_copy[mask] = 59
+            ptm_input_ids.append(torch.from_numpy(ids_copy))
+        ptm_input_ids = torch.stack(ptm_input_ids).long()
 
         # 检查是否有functional role数据
         has_functional_role = "functional_role" in batch[0]
@@ -1050,6 +1004,9 @@ def main():
             # 使用 torch.stack 处理functional role数据
             functional_role = torch.stack([torch.from_numpy(fr) for fr in functional_role_list]).float()
             functional_role_position = torch.stack([torch.from_numpy(frp) for frp in functional_role_position_list]).long()
+
+            # 创建 position_mask: functional_role_position > 0 表示有functional role的位置
+            position_mask = (functional_role_position > 0)
 
         # 基础返回结构（移除字符串对象）
         result = {
@@ -1069,6 +1026,7 @@ def main():
         if has_functional_role:
             result["functional_role"] = functional_role  # float CPU tensor
             result["functional_role_position"] = functional_role_position  # long CPU tensor
+            result["position_mask"] = position_mask  # bool CPU tensor
 
         return result
     
