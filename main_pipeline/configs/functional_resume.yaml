@@ -1,0 +1,33 @@
+dataset:
+  dataset_dir: /home/zz/zheng/ptm-mlm/main_pipeline/memmap_functional
+  preload_all: false
+  sequence_column_name: ptm_seq
+  test_size: 5000
+  use_functional_role: false
+  val_size: 10000
+exp_name: combine
+model:
+  block_config:
+    alpha: 32
+    dropout: 0.1
+    rank: 8
+    type: lora
+  d_model: 1024
+  heads_config:
+  - type: original
+    weight: 1.0
+  - type: ptm
+    weight: 1.0
+preprocess:
+  dataset_location: /home/zz/zheng/ptm-mlm/main_pipeline/datasets/processing_data/functional_role/ptm_sites_with_functional_role.csv
+report_to: []
+seed: 42
+training:
+  esm_model: esmc_600m
+  log_steps: 1000
+  lr: 0.0004
+  max_sequence_length: 512
+  num_train_epochs: 40
+  per_device_train_batch_size: 512
+  repr_layer: 30
+  resume_from_output: /home/zz/zheng/ptm-mlm/main_pipeline/outputs/functional-2026-01-08-23-10-31

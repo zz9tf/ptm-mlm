@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 import argparse
-from transformers.trainer import DataLoader
+from torch.utils.data import DataLoader
 # Removed autocast and GradScaler - using pure FP16 training
 import os
 import json
@@ -111,7 +111,6 @@ def train(
     val_loader,
     optimizer,
     scheduler,
-    tokenizer,
     logger,
     accelerator: Accelerator,
     checkpoint_dir: str,
@@ -126,7 +125,6 @@ def train(
     @param val_loader: Validation data loader.
     @param optimizer: Optimizer instance.
     @param scheduler: Learning rate scheduler instance.
-    @param tokenizer: Tokenizer instance.
     @param logger: Logger instance.
     @param accelerator: Accelerator instance.
     @param checkpoint_dir: Checkpoint directory with timestamp.
@@ -180,23 +178,34 @@ def train(
                 accelerator.print(f"📈 Last Training Performance:")
                 if last_metrics.get("train"):
                     train_metrics = last_metrics["train"]
-                    accelerator.print(f"   - Train Loss: {train_metrics.get('train_loss', 'N/A'):.4f}")
-                    accelerator.print(f"   - Train Acc: {train_metrics.get('train_acc', 'N/A'):.4f}")
-                    accelerator.print(f"   - Train PTM Acc: {train_metrics.get('train_ptm_acc', 'N/A'):.4f}")
-                    accelerator.print(f"   - Train PPL: {train_metrics.get('train_preplexity', 'N/A'):.2f}")
-                
+                    train_loss = train_metrics.get('train_loss')
+                    train_acc = train_metrics.get('train_acc')
+                    train_ptm_acc = train_metrics.get('train_ptm_acc')
+                    train_ppl = train_metrics.get('train_preplexity')
+                    accelerator.print(f"   - Train Loss: {train_loss:.4f}" if train_loss is not None else f"   - Train Loss: N/A")
+                    accelerator.print(f"   - Train Acc: {train_acc:.4f}" if train_acc is not None else f"   - Train Acc: N/A")
+                    accelerator.print(f"   - Train PTM Acc: {train_ptm_acc:.4f}" if train_ptm_acc is not None else f"   - Train PTM Acc: N/A")
+                    accelerator.print(f"   - Train PPL: {train_ppl:.2f}" if train_ppl is not None else f"   - Train PPL: N/A")
+
                 if last_metrics.get("val"):
                     val_metrics = last_metrics["val"]
-                    accelerator.print(f"   - Val Loss: {val_metrics.get('val_loss', 'N/A'):.4f}")
-                    accelerator.print(f"   - Val Acc: {val_metrics.get('val_acc', 'N/A'):.4f}")
-                    accelerator.print(f"   - Val PTM Acc: {val_metrics.get('val_ptm_acc', 'N/A'):.4f}")
-                    accelerator.print(f"   - Val PPL: {val_metrics.get('val_preplexity', 'N/A'):.2f}")
+                    val_loss = val_metrics.get('val_loss')
+                    val_acc = val_metrics.get('val_acc')
+                    val_ptm_acc = val_metrics.get('val_ptm_acc')
+                    val_ppl = val_metrics.get('val_preplexity')
+                    accelerator.print(f"   - Val Loss: {val_loss:.4f}" if val_loss is not None else f"   - Val Loss: N/A")
+                    accelerator.print(f"   - Val Acc: {val_acc:.4f}" if val_acc is not None else f"   - Val Acc: N/A")
+                    accelerator.print(f"   - Val PTM Acc: {val_ptm_acc:.4f}" if val_ptm_acc is not None else f"   - Val PTM Acc: N/A")
+                    accelerator.print(f"   - Val PPL: {val_ppl:.2f}" if val_ppl is not None else f"   - Val PPL: N/A")
                 
                 if last_metrics.get("test"):
                     test_metrics = last_metrics["test"]
-                    accelerator.print(f"   - Test Loss: {test_metrics.get('test_loss', 'N/A'):.4f}")
-                    accelerator.print(f"   - Test Acc: {test_metrics.get('test_acc', 'N/A'):.4f}")
-                    accelerator.print(f"   - Test PTM Acc: {test_metrics.get('test_ptm_acc', 'N/A'):.4f}")
+                    test_loss = test_metrics.get('test_loss')
+                    test_acc = test_metrics.get('test_acc')
+                    test_ptm_acc = test_metrics.get('test_ptm_acc')
+                    accelerator.print(f"   - Test Loss: {test_loss:.4f}" if test_loss is not None else f"   - Test Loss: N/A")
+                    accelerator.print(f"   - Test Acc: {test_acc:.4f}" if test_acc is not None else f"   - Test Acc: N/A")
+                    accelerator.print(f"   - Test PTM Acc: {test_ptm_acc:.4f}" if test_ptm_acc is not None else f"   - Test PTM Acc: N/A")
             
             accelerator.print(f"🎯 Training will continue from Epoch {start_epoch} (displayed as Epoch {start_epoch + 1}/{train_args.get('num_train_epochs', 10)}) to Epoch {train_args.get('num_train_epochs', 10)}")
             accelerator.print("=" * 80)
@@ -231,7 +240,7 @@ def train(
         )
         
         for batch in train_pbar:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             # Get data from batch (already tokenized in collate_fn)
             # Embeddings 已经是 float16，只需传输到 device，保持原有精度
@@ -239,21 +248,21 @@ def train(
             pad_mask = batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             original_input_ids = batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             ptm_input_ids = batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
-            if "position_mask" in batch:
-                position_mask = batch["position_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            if "functional_role_position" in batch:
+                functional_role_position = batch["functional_role_position"].to(device, non_blocking=True)  # (batch_size,)
             else:
-                position_mask = None
+                functional_role_position = None
 
             # Get functional role data if available
             functional_role = batch.get("functional_role", None)
             functional_role_position = batch.get("functional_role_position", None)
             if functional_role is not None:
-                functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
-                functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                functional_role = functional_role.to(device, non_blocking=True)  # (batch_size,)
+                functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
             
             # 🚀 纯 FP16: 直接前向传播 (模型参数已经是 float16)
             # Forward pass through model
-            outputs = model(embeddings=embeddings, position_mask=position_mask)  # Dict[str, torch.Tensor] - {head_name: logits}
+            outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor] - {head_name: logits}
 
             # Get the actual model (handle accelerator wrapping)
             actual_model = model.module if hasattr(model, 'module') else model
@@ -272,13 +281,20 @@ def train(
                 elif head_type == "ptm":
                     loss_compute_related["target"] = ptm_input_ids
                 elif head_type == "functional_role":
-                    loss_compute_related["target"] = functional_role
+                    # functional_role现在是(batch_size,)的形状，每个batch一个标签
+                    loss_compute_related["target"] = functional_role  # (batch_size,)
 
                 losses_compute_related[head_type] = loss_compute_related
 
             # Compute losses using model's compute_loss method
             losses = actual_model.compute_loss(losses_compute_related)
             total_loss = losses["total"]
+
+            # Print detailed loss breakdown
+            print(f"Detailed losses: total={total_loss.item():.4f}")
+            for head_name, head_loss in losses.items():
+                if head_name != 'total':
+                    print(f"  {head_name}_loss: {head_loss.item():.4f}")
 
             # Compute accuracy for each head
             head_accs = {}
@@ -393,13 +409,13 @@ def train(
                         functional_role = val_batch.get("functional_role", None)
                         functional_role_position = val_batch.get("functional_role_position", None)
                         if functional_role is not None:
-                            functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
-                            functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                            functional_role = functional_role.to(device, non_blocking=True)  # (batch_size,)
+                            functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
 
                         
                         # 🚀 纯 FP16: 验证前向传播
                         # Forward pass through model
-                        outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor]
+                        outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                         # Get the actual model (handle accelerator wrapping)
                         actual_model = model.module if hasattr(model, 'module') else model
@@ -425,6 +441,13 @@ def train(
                         losses = actual_model.compute_loss(losses_compute_related)
                         loss = losses["total"]
 
+                        # Print detailed loss breakdown for validation
+                        if total_steps % train_args.get("log_steps", 100) == 0:
+                            print(f"Val detailed losses: total={loss.item():.4f}")
+                            for head_name, head_loss in losses.items():
+                                if head_name != 'total':
+                                    print(f"  val_{head_name}_loss: {head_loss.item():.4f}")
+
                         # Compute accuracy for each head
                         original_logits = outputs.get("original", None)
                         ptm_logits = outputs.get("ptm", None)
@@ -443,7 +466,7 @@ def train(
                             ptm_acc = torch.tensor(0.0, device=device)
                     
                     # compute perplexity
-                    preplexity = torch.exp(loss)
+                    preplexity = torch.exp(torch.clamp(loss.detach().float(), max=10))
                     
                     # Accumulate metrics for averaging
                     val_losses.append(loss.item())
@@ -475,9 +498,7 @@ def train(
                     del outputs, losses_compute_related, losses, original_logits, ptm_logits
                     del acc, ptm_acc, preplexity, loss, non_padding_mask
                 
-                # Clean up validation variables and clear cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Clean up validation variables (empty_cache moved to epoch end)
                 
                 # Calculate and log average validation metrics
                 if accelerator.is_local_main_process and len(val_losses) > 0:
@@ -599,12 +620,12 @@ def train(
                     functional_role = test_batch.get("functional_role", None)
                     functional_role_position = test_batch.get("functional_role_position", None)
                     if functional_role is not None:
-                        functional_role = functional_role.to(device, non_blocking=True)  # (batch_size, max_seq_len)
-                        functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                        functional_role = functional_role.to(device, non_blocking=True)  # (batch_size,)
+                        functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
                     
                     # 🚀 纯 FP16: 测试前向传播
                     # Forward pass through model
-                    outputs = model(embeddings=embeddings)  # Dict[str, torch.Tensor]
+                    outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                     # Get the actual model (handle accelerator wrapping)
                     actual_model = model.module if hasattr(model, 'module') else model
@@ -631,6 +652,12 @@ def train(
                     losses = actual_model.compute_loss(losses_compute_related)
                     loss = losses["total"]
 
+                    # Print detailed loss breakdown for test
+                    print(f"Test detailed losses: total={loss.item():.4f}")
+                    for head_name, head_loss in losses.items():
+                        if head_name != 'total':
+                            print(f"  test_{head_name}_loss: {head_loss.item():.4f}")
+
                     
                     # Compute accuracy for each head
                     original_logits = outputs.get("original", None)
@@ -644,7 +671,10 @@ def train(
                         acc = torch.tensor(0.0, device=device)
                     
                     # Compute PTM accuracy on ptm at PTM sites
-                    acc = (logits.argmax(dim=-1) == ptm_input_ids).float().mean()
+                    if ptm_logits is not None:
+                        ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
+                    else:
+                        ptm_acc = torch.tensor(0.0, device=device)
                 
                 # compute perplexity
                 preplexity = torch.exp(loss)
@@ -770,7 +800,7 @@ def main():
     # Now Accelerator initializes and can only see GPUs specified in CUDA_VISIBLE_DEVICES
     accelerator = Accelerator(
         kwargs_handlers=[kwargs],
-        mixed_precision="bf16"  # 启用内置 AMP + GradScaler
+        mixed_precision=None  # 临时禁用 AMP 调试 NaN 问题
     )
     device = accelerator.device
     set_seed(cfg.get("seed", 42))
@@ -849,6 +879,16 @@ def main():
     if accelerator.is_local_main_process:
         mode_str = "preload mode" if preload_all else "memmap mode"
         print(f"🚀 Loading dataset from memmap format ({mode_str}): {dataset_dir}")
+    
+    # 如果 resume，尝试从 output_dir 加载已有的 split_mapping.json
+    split_mapping_path = None
+    if resume_from_output and os.path.exists(resume_from_output):
+        existing_split_mapping_path = os.path.join(resume_from_output, "split_mapping.json")
+        if os.path.exists(existing_split_mapping_path):
+            split_mapping_path = existing_split_mapping_path
+            if accelerator.is_local_main_process:
+                print(f"📂 Loading existing split_mapping from: {split_mapping_path}")
+    
     dataset = get_ptm_dataset_memmap(
         dataset_dir=dataset_dir,
         device=torch.device('cpu'),  # 数据先放在CPU，让pin_memory处理GPU传输
@@ -857,6 +897,7 @@ def main():
         test_size=test_size,
         preload_all=preload_all,
         use_functional_role=use_functional_role,
+        split_mapping_path=split_mapping_path,
     )
     
     # Log dataset split information and save split mapping (only on main process)
@@ -918,32 +959,67 @@ def main():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         
         ckpt = torch.load(ckpt_path, map_location='cpu')
-        model_config_dict = ckpt["config"]
         
         # Initialize PTMModel with saved config
         model = PTMModel(
             embed_dim=embed_dim,
             vocab_size=vocab_size,
-            d_model=model_config_dict.get("d_model", d_model),
-            block_config=model_config_dict.get("block_config", block_config),
-            heads_config=model_config_dict.get("heads_config", heads_config),
+            d_model=d_model,
+            block_config=block_config,
+            heads_config=heads_config,
             device=device,
-            dtype=torch.float16,  # 统一使用 float16 精度
+            dtype=torch.float32,  # FP32 权重，让 AMP 处理前向精度
         )
         
         # Load state dict
-        model.load_state_dict(ckpt["model"], strict=True)
+        missing_keys, unexpected_keys = model.load_state_dict(ckpt["model"], strict=False)
+
+        # 检查加载的参数是否有NaN
+        if accelerator.is_local_main_process:
+            for name, param in model.named_parameters():
+                if not torch.isfinite(param).all():
+                    accelerator.print(f"🚨 NaN detected in loaded parameter: {name}")
+                    bad = (~torch.isfinite(param)).nonzero(as_tuple=False)[:5]
+                    accelerator.print(f"   NaN locations: {bad.tolist()}")
+
+        # 安全初始化缺失的参数（避免随机初始化导致NaN）
+        if missing_keys:
+            if accelerator.is_local_main_process:
+                accelerator.print(f"⚠️  Missing keys in checkpoint: {len(missing_keys)}")
+            for key in missing_keys:
+                if 'base_ln.weight' in key:
+                    # LayerNorm weight should be 1.0
+                    param = dict(model.named_parameters())[key]
+                    param.data.fill_(1.0)
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"   ✅ Initialized {key} to 1.0 (LayerNorm default)")
+                elif 'base_ln.bias' in key or 'base_linear.bias' in key:
+                    # LayerNorm/Linear bias should be 0.0
+                    param = dict(model.named_parameters())[key]
+                    param.data.zero_()
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"   ✅ Initialized {key} to 0.0 (default)")
+                else:
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"   ⚠️  {key} will use random initialization")
+        
         # 检查 checkpoint 参数类型，仅在需要时转换（避免不必要的转换）
         first_param = next(model.parameters())
-        if first_param.dtype != torch.float16:
-            # Checkpoint 是 float32，需要转换为 float16（仅转换一次）
+        # 检查是否使用混合精度训练 - 如果 train_args 中没有设置或设置为 None，则不使用混合精度
+        mixed_precision_setting = train_args.get("mixed_precision")
+        use_mixed_precision = mixed_precision_setting is not None and mixed_precision_setting == "bf16"
+        if first_param.dtype != torch.float16 and use_mixed_precision:
+            # Checkpoint 是 float32，需要转换为 float16（仅当使用 AMP 时）
             model = model.to(dtype=torch.float16)
             accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
             accelerator.print(f"   Checkpoint was float32, converted to float16")
         else:
-            # Checkpoint 已经是 float16，无需转换
+            # Checkpoint 已经是 float16，或不使用 AMP 时保持 fp32
             accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
-            accelerator.print(f"   Checkpoint already in float16, no conversion needed")
+            if first_param.dtype == torch.float16:
+                accelerator.print(f"   Checkpoint already in float16, no conversion needed")
+            else:
+                accelerator.print(f"   Keeping checkpoint in float32 (AMP disabled)")
     else:
         # Initialize PTMModel with block and heads configuration
         model = PTMModel(
@@ -970,8 +1046,9 @@ def main():
         """
         max_seq_len = batch[0]["embeddings"].shape[0]  # 所有样本都有相同形状
 
-        # 批量堆叠 embeddings（保持 float16 CPU tensor）
+        # 批量堆叠 embeddings，转换为 fp32 以匹配模型精度
         embeddings = torch.stack([item["embeddings"] for item in batch])  # (batch_size, max_seq_len, embed_dim)
+        embeddings = embeddings.float()  # 转换为 fp32
 
         # 收集序列长度
         seq_lengths = [item["seq_length"] for item in batch]
@@ -996,17 +1073,36 @@ def main():
         ptm_input_ids = torch.stack(ptm_input_ids).long()
 
         # 检查是否有functional role数据
-        has_functional_role = "functional_role" in batch[0]
-        if has_functional_role:
+        if use_functional_role:
             functional_role_list = [item["functional_role"] for item in batch]
             functional_role_position_list = [item["functional_role_position"] for item in batch]
+            range_list = [item["range"] for item in batch]  # 现在已经是 [start, end, length] 数组
 
-            # 使用 torch.stack 处理functional role数据
-            functional_role = torch.stack([torch.from_numpy(fr) for fr in functional_role_list]).float()
-            functional_role_position = torch.stack([torch.from_numpy(frp) for frp in functional_role_position_list]).long()
+            # 优化：functional_role直接使用标量，避免不必要的维度
+            functional_role = torch.stack([torch.from_numpy(fr) for fr in functional_role_list]).float().view(-1)  # (batch_size,)
+            functional_role_position_abs = torch.stack([torch.from_numpy(frp) for frp in functional_role_position_list]).long().view(-1)  # (batch_size,)
+            ranges = torch.stack([torch.from_numpy(r) for r in range_list]).long()  # [batch_size, 3]
 
-            # 创建 position_mask: functional_role_position > 0 表示有functional role的位置
-            position_mask = (functional_role_position > 0)
+            # 将绝对位置转换为相对window内的位置
+            # functional_role_position_abs: [batch_size] (1-based absolute positions)
+            # ranges[:, 0]: [batch_size] (start positions, 0-based)
+            functional_role_position = functional_role_position_abs - 1 - ranges[:, 0]  # 1-based to 0-based, then relative to window
+
+            # 检查位置是否在有效范围内 [0, length)
+            lengths = ranges[:, 2]  # [batch_size]
+            valid_mask = (functional_role_position >= 0) & (functional_role_position < lengths)
+
+            if not valid_mask.all():
+                invalid_indices = (~valid_mask).nonzero(as_tuple=True)[0]
+                error_msg = f"Some functional role positions are outside the current window! {len(invalid_indices)} out of {len(functional_role_position)} positions are invalid."
+                for idx in invalid_indices[:3]:  # 只显示前3个错误
+                    abs_pos = functional_role_position_abs[idx].item()
+                    rel_pos = functional_role_position[idx].item()
+                    start_pos = ranges[idx, 0].item()
+                    end_pos = ranges[idx, 1].item()
+                    length = lengths[idx].item()
+                    error_msg += f"\n  Sample {idx}: abs_pos={abs_pos}, rel_pos={rel_pos}, window=[{start_pos}, {end_pos}], length={length}"
+                raise ValueError(error_msg)
 
         # 基础返回结构（移除字符串对象）
         result = {
@@ -1014,7 +1110,7 @@ def main():
             "pad_mask": pad_mask,      # bool CPU tensor
             "original_input_ids": original_input_ids,  # long CPU tensor
             "ptm_input_ids": ptm_input_ids,           # long CPU tensor
-            "seq_lengths": seq_lengths,               # list of int
+            "seq_lengths": seq_lengths_tensor,         # (batch_size,) tensor
         }
 
         # 可选：只在需要时添加 unique_ids（从 protein_idx 映射）
@@ -1023,11 +1119,9 @@ def main():
             result["protein_indices"] = protein_indices
 
         # 如果有functional role数据，添加到结果中
-        if has_functional_role:
+        if use_functional_role:
             result["functional_role"] = functional_role  # float CPU tensor
-            result["functional_role_position"] = functional_role_position  # long CPU tensor
-            result["position_mask"] = position_mask  # bool CPU tensor
-
+            result["functional_role_position"] = functional_role_position  # long CPU tensor (batch_size,)
         return result
     
     # 🚀 优化 DataLoader 配置：多 worker + prefetch + persistent workers
@@ -1076,7 +1170,6 @@ def main():
     )
 
     # 🚀 纯 float16 训练：不使用 GradScaler（因为模型参数已经是 float16）
-    scaler = None
     if accelerator.is_local_main_process:
         accelerator.print(f"🔥 AMP enabled: {accelerator.mixed_precision} precision training")
 
@@ -1098,13 +1191,32 @@ def main():
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location='cpu')
             if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-                optimizer.load_state_dict(ckpt["optimizer"])
-                if accelerator.is_local_main_process:
-                    accelerator.print(f"✅ Optimizer state restored")
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer"])
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"✅ Optimizer state restored")
+                except ValueError as e:
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"⚠️ Optimizer state not restored (parameter mismatch): {e}")
+                        accelerator.print(f"   Continuing with fresh optimizer state")
+                        # 尝试从checkpoint中恢复学习率，确保学习率正确
+                        if "scheduler" in ckpt and ckpt["scheduler"] is not None:
+                            scheduler_state = ckpt["scheduler"]
+                            if "base_lrs" in scheduler_state and len(scheduler_state["base_lrs"]) > 0:
+                                target_lr = scheduler_state["base_lrs"][0]
+                                # 设置优化器的学习率
+                                for param_group in optimizer.param_groups:
+                                    param_group["lr"] = target_lr
+                                accelerator.print(f"   ✅ Set optimizer LR to checkpoint value: {target_lr}")
             if "scheduler" in ckpt and ckpt["scheduler"] is not None:
-                scheduler.load_state_dict(ckpt["scheduler"])
-                if accelerator.is_local_main_process:
-                    accelerator.print(f"✅ Scheduler state restored")
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"✅ Scheduler state restored")
+                except ValueError as e:
+                    if accelerator.is_local_main_process:
+                        accelerator.print(f"⚠️ Scheduler state not restored (parameter mismatch): {e}")
+                        accelerator.print(f"   Continuing with fresh scheduler state")
 
     train(
         config_dict=cfg,
@@ -1114,7 +1226,6 @@ def main():
         val_loader=val_loader,
         optimizer=optimizer,
         scheduler=scheduler,
-        tokenizer=tokenizer,
         logger=logger,
         accelerator=accelerator,
         checkpoint_dir=output_dir,

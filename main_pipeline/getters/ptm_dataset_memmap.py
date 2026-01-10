@@ -119,19 +119,19 @@ class PTMDatasetMemmap(TorchDataset):
             ]
 
             # 如果使用functional role，添加相关文件
-            if getattr(self, 'use_functional_role', False):
+            if self.use_functional_role:
                 files_to_load.extend([
                     {
                         "name": "functional_role.dat",
-                        "dtype": np.float32,
-                        "shape": (self.total_samples, self.sequence_length),
+                        "dtype": np.int8,
+                        "shape": (self.total_samples,),
                         "attr_memmap": "functional_role_memmap",
                         "attr_data": "functional_role_data"
                     },
                     {
                         "name": "functional_role_position.dat",
                         "dtype": np.int32,
-                        "shape": (self.total_samples, self.sequence_length),
+                        "shape": (self.total_samples,),
                         "attr_memmap": "functional_role_position_memmap",
                         "attr_data": "functional_role_position_data"
                     }
@@ -272,18 +272,18 @@ class PTMDatasetMemmap(TorchDataset):
             )
 
             # 如果使用functional role，加载相关memmap文件
-            if getattr(self, 'use_functional_role', False):
+            if self.use_functional_role:
                 self.functional_role_memmap = np.memmap(
                     os.path.join(self.dataset_dir, "functional_role.dat"),
-                    dtype=np.float32,
+                    dtype=np.int8,
                     mode='r',
-                    shape=(self.total_samples, self.sequence_length)
+                    shape=(self.total_samples,)
                 )
                 self.functional_role_position_memmap = np.memmap(
                     os.path.join(self.dataset_dir, "functional_role_position.dat"),
                     dtype=np.int32,
                     mode='r',
-                    shape=(self.total_samples, self.sequence_length)
+                    shape=(self.total_samples,)
                 )
         
         # 初始化 samples_by_split
@@ -434,7 +434,7 @@ class PTMDatasetMemmap(TorchDataset):
             - 'orig_ids': np.ndarray[int32]，原始 token ids
             - 'ptm_ids': np.ndarray[int32]，PTM token ids
             - 'seq_length': int (实际长度，用于 padding mask)
-            - 'range': Tuple[int, int], (start, end) 范围
+            - 'range': np.ndarray[int32], [start, end, length] 范围数组
             - 'sample_idx': int, 原始样本索引
             - 'protein_idx': int, 蛋白质索引（避免字符串查找）
         """
@@ -454,9 +454,9 @@ class PTMDatasetMemmap(TorchDataset):
             protein_idx = int(self.meta_id_data[sample_idx])
 
             # 如果使用functional role，读取相关数据
-            if getattr(self, 'use_functional_role', False):
-                functional_role = self.functional_role_data[sample_idx]  # (512,) float32
-                functional_role_position = self.functional_role_position_data[sample_idx]  # (512,) int32
+            if self.use_functional_role:
+                functional_role = np.array(self.functional_role_data[sample_idx], dtype=np.int8)  # numpy数组
+                functional_role_position = np.array(self.functional_role_position_data[sample_idx], dtype=np.int32)  # numpy数组
         else:
             # 从 memmap 中读取数据（按需加载）
             embedding = self.embeddings_memmap[sample_idx]  # (512, 1152) float16
@@ -466,16 +466,13 @@ class PTMDatasetMemmap(TorchDataset):
             protein_idx = int(self.meta_id_memmap[sample_idx])
 
             # 如果使用functional role，读取相关数据
-            if getattr(self, 'use_functional_role', False):
-                functional_role = self.functional_role_memmap[sample_idx]  # (512,) float32
-                functional_role_position = self.functional_role_position_memmap[sample_idx]  # (512,) int32
-        
-        # 获取蛋白质 ID
-        protein_id = self.idx_to_protein_id[protein_idx]
+            if self.use_functional_role:
+                functional_role = np.array(self.functional_role_memmap[sample_idx], dtype=np.int8)  # numpy数组
+                functional_role_position = np.array(self.functional_role_position_memmap[sample_idx], dtype=np.int32)  # numpy数组
         
         # 获取实际序列长度
         seq_length = int(range_data[2])  # length
-        range_tuple = (int(range_data[0]), int(range_data[1]))  # (start, end)
+        range_array = range_data.astype(np.int32)  # [start, end, length] as int32 array
 
         # 保持 float16 CPU tensor，避免不必要的转换和传输
         embedding_tensor = torch.from_numpy(embedding)  # 仍是 float16 CPU tensor
@@ -485,15 +482,15 @@ class PTMDatasetMemmap(TorchDataset):
             "orig_ids": orig_tokens,             # np.ndarray[int32]，原始 ids
             "ptm_ids": ptm_tokens,               # np.ndarray[int32]，PTM ids
             "seq_length": seq_length,
-            "range": range_tuple,
+            "range": range_array,                # [start, end, length] int32 array
             "sample_idx": sample_idx,
             "protein_idx": protein_idx,          # 直接用 int，避免字符串查找
         }
 
         # 如果使用functional role，添加相关数据
-        if getattr(self, 'use_functional_role', False):
-            result["functional_role"] = functional_role  # np.ndarray[float32]，functional role 值
-            result["functional_role_position"] = functional_role_position  # np.ndarray[int32]，functional role 位置
+        if self.use_functional_role:
+            result["functional_role"] = functional_role  # int8，functional role 值
+            result["functional_role_position"] = functional_role_position  # int32，functional role 位置
 
         return result
     
@@ -528,7 +525,7 @@ class PTMDatasetMemmap(TorchDataset):
                 dataset.meta_id_data = self.meta_id_data
 
                 # 如果使用functional role，共享相关数据
-                if getattr(self, 'use_functional_role', False):
+                if self.use_functional_role:
                     dataset.functional_role_data = self.functional_role_data
                     dataset.functional_role_position_data = self.functional_role_position_data
             else:
@@ -540,7 +537,7 @@ class PTMDatasetMemmap(TorchDataset):
                 dataset.meta_id_memmap = self.meta_id_memmap
 
                 # 如果使用functional role，共享相关memmap
-                if getattr(self, 'use_functional_role', False):
+                if self.use_functional_role:
                     dataset.functional_role_memmap = self.functional_role_memmap
                     dataset.functional_role_position_memmap = self.functional_role_position_memmap
             
@@ -555,6 +552,38 @@ class PTMDatasetMemmap(TorchDataset):
             dataset.seed = self.seed
             dataset.val_size = self.val_size
             dataset.test_size = self.test_size
+            dataset.use_functional_role = self.use_functional_role
+
+            # 初始化其他必要属性
+            dataset.dataset_dir = self.dataset_dir
+            dataset.device = self.device
+            dataset.preload_all = self.preload_all
+            dataset.meta_mapping = self.meta_mapping
+            dataset.total_samples = self.total_samples
+            dataset.embedding_dim = self.embedding_dim
+            dataset.sequence_length = self.sequence_length
+            dataset.idx_to_protein_id = self.idx_to_protein_id
+            dataset.protein_id_to_idx = self.protein_id_to_idx
+
+            # 共享数据
+            if self.preload_all:
+                dataset.embeddings_data = self.embeddings_data
+                dataset.orig_tokens_data = self.orig_tokens_data
+                dataset.ptm_tokens_data = self.ptm_tokens_data
+                dataset.range_data = self.range_data
+                dataset.meta_id_data = self.meta_id_data
+                if self.use_functional_role:
+                    dataset.functional_role_data = self.functional_role_data
+                    dataset.functional_role_position_data = self.functional_role_position_data
+            else:
+                dataset.embeddings_memmap = self.embeddings_memmap
+                dataset.orig_tokens_memmap = self.orig_tokens_memmap
+                dataset.ptm_tokens_memmap = self.ptm_tokens_memmap
+                dataset.range_memmap = self.range_memmap
+                dataset.meta_id_memmap = self.meta_id_memmap
+                if self.use_functional_role:
+                    dataset.functional_role_memmap = self.functional_role_memmap
+                    dataset.functional_role_position_memmap = self.functional_role_position_memmap
 
             # 确保 split datasets 也有扁平化索引
             dataset._build_flat_index()
@@ -590,6 +619,7 @@ def get_ptm_dataset_memmap(
     test_size: Optional[int] = None,
     preload_all: bool = False,
     use_functional_role: bool = False,
+    split_mapping_path: Optional[str] = None,
 ) -> Dict[str, Optional[PTMDatasetMemmap]]:
     """
     从 memmap 格式加载 PTM 数据集并分割为 train/val/test。
@@ -601,6 +631,7 @@ def get_ptm_dataset_memmap(
     @param test_size: 测试集样本数
     @param preload_all: 是否预加载所有数据到内存（True=预加载模式，False=memmap按需加载模式）
     @param use_functional_role: 是否使用 functional role 数据
+    @param split_mapping_path: 如果提供且文件存在，则从该文件加载 split_mapping，而不是重新生成
     @return: 包含 train/val/test PTMDatasetMemmap splits 和 split_mapping 的字典
     """
     dataset = PTMDatasetMemmap(
@@ -617,7 +648,13 @@ def get_ptm_dataset_memmap(
     splits = dataset.get_split_datasets()
     
     # 获取 split mapping 并添加到返回字典
-    split_mapping = dataset.get_split_mapping()
+    # 如果提供了 split_mapping_path 且文件存在，则从文件加载，否则重新生成
+    if split_mapping_path and os.path.exists(split_mapping_path):
+        import json
+        with open(split_mapping_path, 'r', encoding='utf-8') as f:
+            split_mapping = json.load(f)
+    else:
+        split_mapping = dataset.get_split_mapping()
     splits["split_mapping"] = split_mapping
     
     return splits

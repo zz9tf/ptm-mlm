@@ -8,12 +8,6 @@ cd /home/zz/zheng/ptm-mlm/main_pipeline
 # Set GPU (use GPU 0)
 export CUDA_VISIBLE_DEVICES="5"
 
-# Run training with config overrides
+# Run training with config that matches checkpoint
 python train.py \
-    --config configs/base.yaml \
-    exp_name=functional \
-    dataset.preload_all=true \
-    dataset.dataset_dir=/home/zz/zheng/ptm-mlm/main_pipeline/memmap_functional \
-    model.d_model=1024 \
-    training.num_train_epochs=40 \
-    training.per_device_train_batch_size=4096
+    --config configs/functional_resume.yaml

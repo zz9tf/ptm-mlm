@@ -22,7 +22,7 @@ python generate_embeddings.py \
     --config configs/base.yaml \
     --use_original_sequence \
     --original_sequence_column ori_seq \
-    --output_dir embeddings_combined \
+    --output_dir memmap_functional \
     --batch_size 512 \
     --chunk_size_gb 10 \
-    --functional_role  # Extract functional_role labels from dataset CSV if it contains 'functional_role' and 'position' columns
+    --functional_role

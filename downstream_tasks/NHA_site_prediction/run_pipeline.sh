@@ -38,22 +38,22 @@ mkdir -p "${OUTPUT_DIR}"
 
 cd "${WORK_DIR}"
 
-# ============================================
-# Step 1: 生成Embeddings (Generate Embeddings)
-# ============================================
-echo "============================================"
-echo "Step 1: 生成Embeddings"
-echo "============================================"
+# # ============================================
+# # Step 1: 生成Embeddings (Generate Embeddings)
+# # ============================================
+# echo "============================================"
+# echo "Step 1: 生成Embeddings"
+# echo "============================================"
 
-python3 generate_embeddings.py \
-    --model_type "${MODEL_TYPE}" \
-    --data "${DATA}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --batch_size ${BATCH_SIZE} \
-    --max_sequence_length ${MAX_SEQUENCE_LENGTH}
+# python3 generate_embeddings.py \
+#     --model_type "${MODEL_TYPE}" \
+#     --data "${DATA}" \
+#     --output_dir "${OUTPUT_DIR}" \
+#     --batch_size ${BATCH_SIZE} \
+#     --max_sequence_length ${MAX_SEQUENCE_LENGTH}
 
-echo "✅ Step 1 完成: Embeddings已生成"
-echo ""
+# echo "✅ Step 1 完成: Embeddings已生成"
+# echo ""
 
 # ============================================
 # Step 2: 训练分类头并评估 (Train Classification Head and Evaluate)

@@ -23,7 +23,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 from getters.tokenizer import PTMTokenizer
 from utils.config import load_config
-from utils.esm_utils import make_esm_input_ids, load_esm_model
+from utils.esm_utils import load_esm_model
 
 
 def _gather_object(accelerator, obj, device):
@@ -516,6 +516,37 @@ def append_chunk_to_memmap(
     return num_written
 
 
+def preprocess_ptm_sequence_for_esm(ptm_sequence: str, tokenizer: PTMTokenizer) -> str:
+    """
+    预处理PTM序列：将非PTM部分替换为pad_token，直接用于ESM输入
+
+    @param ptm_sequence: 原始PTM序列（包含PTM标记）
+    @param tokenizer: PTMTokenizer实例
+    @return: 处理后的序列，其中非PTM部分被替换为pad_token
+    """
+    # 将PTM序列编码为tokens
+    token_ids = tokenizer.encode(ptm_sequence, add_special_tokens=False)
+
+    # 找出PTM tokens的起始位置
+    ptm_token_start = tokenizer.ptm_token_start  # "PTM" token的起始位置
+
+    # 创建新的token_ids，将非PTM部分替换为pad_token_id
+    pad_token_id = tokenizer.pad_token_id
+    processed_token_ids = []
+
+    for token_id in token_ids:
+        if token_id >= ptm_token_start or tokenizer.is_special_token(torch.tensor(token_id)):
+            # 保留PTM tokens和special tokens
+            processed_token_ids.append(token_id)
+        else:
+            # 将非PTM的普通氨基酸tokens替换为pad_token_id
+            processed_token_ids.append(pad_token_id)
+
+    # 将处理后的token_ids解码回字符串
+    processed_sequence = tokenizer.decode(processed_token_ids)
+    return processed_sequence
+
+
 def extract_windows_for_sequence(
     ac_id: str,
     seq_for_esm: str,
@@ -564,22 +595,12 @@ def extract_windows_for_sequence(
             window_seq = ori_seq_window
             window_len = len(window_seq)
         else:
-            # Use PTM sequence for ESM (will be processed to mask PTM tokens)
-            # Tokenize the PTM sequence window to get token length
-            tokenized = tokenizer(
-                [ptm_seq_window],
-                add_special_tokens=True,
-                max_sequence_length=None,
-            )
-            input_ids = torch.tensor(tokenized[0], device=device)
-            window_len = len(input_ids)
-            
-            # Prepare ESM input: replace PTM tokens with mask
-            window_ids = input_ids.unsqueeze(0)
-            esm_input_ids = make_esm_input_ids(window_ids, tokenizer)
-            decoded_str = tokenizer.decode(esm_input_ids[0].detach().cpu().tolist())
-            decoded_str_clean = decoded_str.replace("<cls>", "").replace("<eos>", "")
-            window_seq = decoded_str_clean
+            # 预处理PTM序列：将非PTM部分直接替换为pad_token
+            processed_ptm_window = preprocess_ptm_sequence_for_esm(ptm_seq_window, tokenizer)
+
+            # 使用处理后的PTM序列作为ESM输入
+            window_seq = processed_ptm_window
+            window_len = len(window_seq)
         
         windows.append({
             'ac_id': ac_id,
@@ -847,6 +868,7 @@ def generate_embeddings_for_dataset(
     repr_layer=33,
     model_type="esm2",
     ac_id_to_ptm_info: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    extract_functional_role: bool = False,
 ):
     """
     Generate ESM embeddings for all sequences in the dataset.
@@ -1142,7 +1164,7 @@ def generate_embeddings_for_dataset(
             seq_for_esm = sequences_for_esm[idx]
             ori_seq_full = ori_sequences[idx]
             ptm_seq_full = ptm_sequences[idx]
-            
+
             windows = extract_windows_for_sequence(
                 ac_id=ac_id,
                 seq_for_esm=seq_for_esm,
@@ -1153,11 +1175,37 @@ def generate_embeddings_for_dataset(
                 use_original_seq=use_original_seq,
                 device=device
             )
-            
-            # Register AC_ID in buffer
-            if windows:
-                buffer.add_ac_id(ac_id, len(windows))
-                all_windows.extend(windows)
+
+            # Filter windows based on functional role mode
+            if extract_functional_role:
+                # Only include windows that have functional role labels
+                filtered_windows = []
+                for window in windows:
+                    char_start = window['char_start']
+                    char_end = window['char_end']
+
+                    # Check if this window has a functional role
+                    has_functional_role = False
+                    if ac_id in ac_id_to_ptm_info:
+                        for ptm_info in ac_id_to_ptm_info[ac_id]:
+                            # position is 1-based, convert to 0-based for comparison
+                            pos_0based = ptm_info['position'] - 1
+                            if char_start <= pos_0based < char_end:
+                                has_functional_role = True
+                                break
+
+                    if has_functional_role:
+                        filtered_windows.append(window)
+
+                # Register AC_ID in buffer only if we have windows with functional roles
+                if filtered_windows:
+                    buffer.add_ac_id(ac_id, len(filtered_windows))
+                    all_windows.extend(filtered_windows)
+            else:
+                # Include all windows when not in functional role mode
+                if windows:
+                    buffer.add_ac_id(ac_id, len(windows))
+                    all_windows.extend(windows)
         
         if not all_windows:
             continue
@@ -1222,16 +1270,22 @@ def generate_embeddings_for_dataset(
                             functional_role = ptm_info['functional_role']
                             functional_role_position = ptm_info['position']  # Store 1-based position
                             break  # Use first matching PTM site
-                
-                buffer.add_window(
-                    ac_id=ac_id,
-                    embedding=embedding,
-                    window_range=(char_start, char_end),  # Character positions in original sequence
-                    ori_seq=window_info['ori_seq_window'],
-                    ptm_seq=window_info['ptm_seq_window'],
-                    functional_role=functional_role,
-                    functional_role_position=functional_role_position
-                )
+
+                # Only add window if it has a functional role label (when in functional role mode)
+                should_add_window = True
+                if extract_functional_role:
+                    should_add_window = (functional_role != -1)
+
+                if should_add_window:
+                    buffer.add_window(
+                        ac_id=ac_id,
+                        embedding=embedding,
+                        window_range=(char_start, char_end),  # Character positions in original sequence
+                        ori_seq=window_info['ori_seq_window'],
+                        ptm_seq=window_info['ptm_seq_window'],
+                        functional_role=functional_role,
+                        functional_role_position=functional_role_position
+                    )
             
             # Step 4: Check if buffer should be flushed
             # Flush when:
@@ -1625,6 +1679,7 @@ def main():
         repr_layer=final_repr_layer,
         model_type=model_type,
         ac_id_to_ptm_info=ac_id_to_ptm_info if extract_functional_role else None,
+        extract_functional_role=extract_functional_role,
     )
 
 

@@ -15,5 +15,5 @@ python train.py \
     dataset.preload_all=true \
     dataset.dataset_dir=/home/zz/zheng/ptm-mlm/main_pipeline/memmap_mamba \
     model.d_model=1024 \
-    training.num_train_epochs=40 \
+    training.num_train_epochs=1 \
     training.per_device_train_batch_size=512

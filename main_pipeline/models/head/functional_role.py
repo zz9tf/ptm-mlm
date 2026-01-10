@@ -21,7 +21,8 @@ class FunctionalRoleHead(nn.Module):
         @param output_size: Output dimension (default: 1 for binary classification)
         @param device: Device to place the model on
         @param dtype: Data type for the model
-        @param **kwargs: Additional arguments (unused)
+        @param mix_type: Feature mixing type ("concat" or "gate", default: "concat")
+        @param **kwargs: Additional arguments
         """
         super().__init__()
         self.type = "functional_role"
@@ -31,40 +32,73 @@ class FunctionalRoleHead(nn.Module):
         self.mix_type = kwargs.get("mix_type", "concat")
         if self.mix_type == "concat":
             self.head = nn.Linear(d_model*2, output_size, bias=False, **factory_kwargs)
+            self.pre_ln = nn.LayerNorm(d_model * 2, eps=1e-3, elementwise_affine=True, **factory_kwargs).to(dtype=torch.float32)
         elif self.mix_type == "gate":
             self.gate_layer = nn.Linear(d_model*2, 1, bias=False, **factory_kwargs)
+            self.gate_ln = nn.LayerNorm(d_model * 2, eps=1e-3, elementwise_affine=True, **factory_kwargs).to(dtype=torch.float32)
             self.head = nn.Linear(d_model, output_size, bias=False, **factory_kwargs)
+            self.pre_ln = nn.LayerNorm(d_model, eps=1e-3, elementwise_affine=True, **factory_kwargs).to(dtype=torch.float32)
         else:
             raise ValueError(f"Invalid mix_type: {self.mix_type}")
     
-    def forward(self, features: torch.Tensor, processed: Dict[str, Any], position_mask: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor, processed: Dict[str, Any], functional_role_position: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
         """
         Predict functional role using pooled features from PTM positions.
 
         @param features: Processed features of shape (batch_size, seq_len, d_model)
         @param processed: Dictionary of processed features from previous heads
-        @param position_mask: Boolean mask indicating PTM positions (batch_size, seq_len)
+        @param functional_role_position: Position indices of PTM positions (batch_size,)
         @param **kwargs: Additional arguments
         @returns: Dictionary containing logits of shape (batch_size, output_size)
         """
+
+        def _check(name, x):
+            if x is None:
+                raise RuntimeError(f"{name} is None")
+            if not torch.isfinite(x).all():
+                bad = (~torch.isfinite(x)).nonzero(as_tuple=False)[:5]
+                raise RuntimeError(f"{name} has NaN/Inf, examples idx={bad.tolist()}")
+            m = x.detach().abs().max().item()
+            if m > 1e4:
+                print(f"[warn] {name} abs_max={m:.2e} (may overflow in fp16/bf16)")
+
         processed_features = processed.get("ptm_features", None)
         if processed_features is None:
             raise ValueError("ptm_features must be provided")
 
+        # before indexing
+        _check("features", features)
+        _check("processed_features", processed_features)
+
         # Extract features at PTM positions
-        masked_features = features[position_mask]  # (num_masked_positions, d_model)
-        masked_ptm_features = processed_features[position_mask]  # (num_masked_positions, d_model)
+        B, _, _ = features.shape
+        b = torch.arange(B, device=features.device)
+
+        ptm_features_selected = features[b, functional_role_position]            # (B, D)
+        ptm_processed_selected = processed_features[b, functional_role_position]  # (B, D)
+
+        # after selecting ptm vectors
+        _check("ptm_features_selected", ptm_features_selected)
+        _check("ptm_processed_selected", ptm_processed_selected)
 
         if self.mix_type == "concat":
-            combined_features = torch.cat([masked_features, masked_ptm_features], dim=-1)
+            combined_features = torch.cat([ptm_features_selected, ptm_processed_selected], dim=-1)
+            combined_features = self.pre_ln(combined_features.float()).to(combined_features.dtype)
         elif self.mix_type == "gate":
-            gate_input = torch.cat([masked_features, masked_ptm_features], dim=-1)
+            gate_input = torch.cat([ptm_features_selected, ptm_processed_selected], dim=-1)
+            gate_input = self.gate_ln(gate_input.float()).to(gate_input.dtype)
             gate = torch.sigmoid(self.gate_layer(gate_input))
-            combined_features = masked_features * gate + masked_ptm_features * (1 - gate)
+            combined_features = ptm_features_selected * gate + ptm_processed_selected * (1 - gate)
+            combined_features = self.pre_ln(combined_features.float()).to(combined_features.dtype)
+
+        # after combine
+        _check("combined_features", combined_features)
 
         # Compute logits for masked positions
         logits = self.head(combined_features)  # (num_masked_positions, output_size)
 
+        # after head
+        _check("logits", logits)
         return {
             "logits": logits
         }
@@ -90,6 +124,6 @@ class FunctionalRoleHead(nn.Module):
 
         return F.binary_cross_entropy_with_logits(
             logits.squeeze(-1),  # (batch_size,)
-            targets.squeeze(-1).float()  # (batch_size,)
+            targets.float()  # (batch_size,)
         )
 

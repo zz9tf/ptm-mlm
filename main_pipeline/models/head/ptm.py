@@ -34,15 +34,31 @@ class PTMHead(nn.Module):
     def forward(self, features: torch.Tensor, processed: Dict[str, Any], **kwargs) -> torch.Tensor:
         """
         Generate PTM sequence logits.
-        
+
         @param features: Processed features of shape (batch_size, seq_len, d_model)
         @param processed: Dictionary of processed features from previous heads
         @param **kwargs: Additional arguments (unused)
         @returns: Logits of shape (batch_size, seq_len, vocab_size)
         """
+
+        def _check(name, x):
+            if x is None:
+                raise RuntimeError(f"{name} is None")
+            if not torch.isfinite(x).all():
+                bad = (~torch.isfinite(x)).nonzero(as_tuple=False)[:5]
+                raise RuntimeError(f"{name} has NaN/Inf, examples idx={bad.tolist()}")
+            m = x.detach().abs().max().item()
+            if m > 1e4:
+                print(f"[warn] {name} abs_max={m:.2e} (may overflow in fp16/bf16)")
+
+        _check("ptm_input_features", features)
         features = self.middle_layer(features)
+        _check("ptm_middle_features", features)
+        logits = self.head(features)
+        _check("ptm_logits", logits)
+
         return {
-            "logits": self.head(features),
+            "logits": logits,
             "features": features
         }
     
