@@ -218,7 +218,7 @@ def train(
 
     # Embeddings are already loaded in the dataset, no need for separate loader
     
-    model_to_save = model if accelerator.distributed_type==DistributedType.NO else model.module
+    model_to_save = accelerator.unwrap_model(model)
     total_steps = start_step
     
     # Debug: Print epoch range
@@ -260,9 +260,10 @@ def train(
                 functional_role = functional_role.to(device, non_blocking=True)  # (batch_size,)
                 functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
             
-            # 🚀 纯 FP16: 直接前向传播 (模型参数已经是 float16)
+            # 🚀 bf16 AMP: autocast 处理混合精度
             # Forward pass through model
-            outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor] - {head_name: logits}
+            with accelerator.autocast():
+                outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor] - {head_name: logits}
 
             # Get the actual model (handle accelerator wrapping)
             actual_model = model.module if hasattr(model, 'module') else model
@@ -413,9 +414,10 @@ def train(
                             functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
 
                         
-                        # 🚀 纯 FP16: 验证前向传播
+                        # 🚀 bf16 AMP: autocast 处理混合精度
                         # Forward pass through model
-                        outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
+                        with accelerator.autocast():
+                            outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                         # Get the actual model (handle accelerator wrapping)
                         actual_model = model.module if hasattr(model, 'module') else model
@@ -524,9 +526,12 @@ def train(
                     if avg_val_loss < best_loss:
                         best_loss = avg_val_loss
                         if best_ckpt_path is not None:  # Only save on main process
+                            # Checkpoint 永远保存为 fp32，确保 resume 时兼容性
+                            state_dict_fp32 = {k: v.detach().float().cpu() if torch.is_floating_point(v) else v.detach().cpu()
+                                             for k, v in model_to_save.state_dict().items()}
                             torch.save(
                                 {
-                                    "model": model_to_save.state_dict(),
+                                    "model": state_dict_fp32,
                                     "config": model_config,
                                     "optimizer": optimizer.state_dict() if optimizer is not None else None,
                                     "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -541,9 +546,12 @@ def train(
                             accelerator.print(f"💾 Best model saved! (val_loss: {avg_val_loss:.4f})")
                 if accelerator.is_local_main_process:
                     # save last model with training state
+                    # Checkpoint 永远保存为 fp32，确保 resume 时兼容性
+                    state_dict_fp32 = {k: v.detach().float().cpu() if torch.is_floating_point(v) else v.detach().cpu()
+                                     for k, v in model_to_save.state_dict().items()}
                     torch.save(
                         {
-                            "model": model_to_save.state_dict(),
+                            "model": state_dict_fp32,
                             "config": model_config,
                             "optimizer": optimizer.state_dict() if optimizer is not None else None,
                             "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -574,9 +582,12 @@ def train(
     
     if accelerator.is_local_main_process:
         # save last model with training state
+        # Checkpoint 永远保存为 fp32，确保 resume 时兼容性
+        state_dict_fp32 = {k: v.detach().float().cpu() if torch.is_floating_point(v) else v.detach().cpu()
+                         for k, v in model_to_save.state_dict().items()}
         torch.save(
             {
-                "model": model_to_save.state_dict(),
+                "model": state_dict_fp32,
                 "config": model_config,
                 "optimizer": optimizer.state_dict() if optimizer is not None else None,
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -623,9 +634,10 @@ def train(
                         functional_role = functional_role.to(device, non_blocking=True)  # (batch_size,)
                         functional_role_position = functional_role_position.to(device, non_blocking=True)  # (batch_size,)
                     
-                    # 🚀 纯 FP16: 测试前向传播
+                    # 🚀 bf16 AMP: autocast 处理混合精度
                     # Forward pass through model
-                    outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
+                    with accelerator.autocast():
+                        outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                     # Get the actual model (handle accelerator wrapping)
                     actual_model = model.module if hasattr(model, 'module') else model
@@ -800,7 +812,7 @@ def main():
     # Now Accelerator initializes and can only see GPUs specified in CUDA_VISIBLE_DEVICES
     accelerator = Accelerator(
         kwargs_handlers=[kwargs],
-        mixed_precision=None  # 临时禁用 AMP 调试 NaN 问题
+        mixed_precision="bf16"  # 使用 bf16 AMP：快 + 稳
     )
     device = accelerator.device
     set_seed(cfg.get("seed", 42))
@@ -1003,23 +1015,9 @@ def main():
                     if accelerator.is_local_main_process:
                         accelerator.print(f"   ⚠️  {key} will use random initialization")
         
-        # 检查 checkpoint 参数类型，仅在需要时转换（避免不必要的转换）
-        first_param = next(model.parameters())
-        # 检查是否使用混合精度训练 - 如果 train_args 中没有设置或设置为 None，则不使用混合精度
-        mixed_precision_setting = train_args.get("mixed_precision")
-        use_mixed_precision = mixed_precision_setting is not None and mixed_precision_setting == "bf16"
-        if first_param.dtype != torch.float16 and use_mixed_precision:
-            # Checkpoint 是 float32，需要转换为 float16（仅当使用 AMP 时）
-            model = model.to(dtype=torch.float16)
-            accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
-            accelerator.print(f"   Checkpoint was float32, converted to float16")
-        else:
-            # Checkpoint 已经是 float16，或不使用 AMP 时保持 fp32
-            accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
-            if first_param.dtype == torch.float16:
-                accelerator.print(f"   Checkpoint already in float16, no conversion needed")
-            else:
-                accelerator.print(f"   Keeping checkpoint in float32 (AMP disabled)")
+        # Checkpoint 永远加载为 fp32，让 bf16 AMP 的 autocast 处理精度
+        accelerator.print(f"✅ Model loaded from output directory: {resume_from_output}")
+        accelerator.print(f"   Keeping checkpoint in float32 (bf16 AMP will autocast)")
     else:
         # Initialize PTMModel with block and heads configuration
         model = PTMModel(
@@ -1046,9 +1044,8 @@ def main():
         """
         max_seq_len = batch[0]["embeddings"].shape[0]  # 所有样本都有相同形状
 
-        # 批量堆叠 embeddings，转换为 fp32 以匹配模型精度
+        # 批量堆叠 embeddings（保持原 dtype，让 bf16 AMP autocast 处理）
         embeddings = torch.stack([item["embeddings"] for item in batch])  # (batch_size, max_seq_len, embed_dim)
-        embeddings = embeddings.float()  # 转换为 fp32
 
         # 收集序列长度
         seq_lengths = [item["seq_length"] for item in batch]
@@ -1169,7 +1166,7 @@ def main():
         optimizer, last_epoch=-1, init_lr=lr, on_use=False
     )
 
-    # 🚀 纯 float16 训练：不使用 GradScaler（因为模型参数已经是 float16）
+    # 🚀 bf16 AMP：不使用 GradScaler（bf16 比 fp16 更稳定）
     if accelerator.is_local_main_process:
         accelerator.print(f"🔥 AMP enabled: {accelerator.mixed_precision} precision training")
 

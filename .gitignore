@@ -253,3 +253,4 @@ runs/
 .DS_Store
 Thumbs.db
 memmap*
+embeddings/

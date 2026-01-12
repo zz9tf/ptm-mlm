@@ -7,14 +7,8 @@ import torch
 import sys
 from pathlib import Path
 from tqdm import tqdm
-
-try:
-    from esm.models.esmc import ESMC
-    from esm.sdk.api import ESMProtein, LogitsConfig
-    ESMC_AVAILABLE = True
-except ImportError:
-    ESMC_AVAILABLE = False
-    print("⚠️  esm library not found. Please install: pip install fair-esm")
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, LogitsConfig
 
 
 class ESMCInference:
@@ -23,17 +17,13 @@ class ESMCInference:
     This class is shared across all downstream tasks.
     """
     
-    def __init__(self, device: str = None, max_sequence_length: int = None, layer_index: int = None):
+    def __init__(self, device: str = None, layer_index: int = None):
         """
-        Initialize the ESM-C 600M inference model.
-        
+        Initialize the ESM-C 600M inference model for generating embeddings.
+
         @param device: Device to run inference on (None for auto-detect)
-        @param max_sequence_length: Maximum sequence length (not used for ESM-C, but kept for compatibility)
         @param layer_index: Layer index to extract (1-based). If None, uses last layer (default: None)
         """
-        if not ESMC_AVAILABLE:
-            raise ImportError("esm library is required for ESM-C 600M. Install with: pip install fair-esm")
-        
         # Determine device
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -67,15 +57,9 @@ class ESMCInference:
         
         # ESM-C 600M has 1152 dimensions
         self.hidden_size = 1152
-        
-        # Set max sequence length (for compatibility, ESM-C handles this internally)
-        if max_sequence_length is None:
-            self.max_sequence_length = 1024  # ESM-C default
-        else:
-            self.max_sequence_length = max_sequence_length
-        
+
         print(f"✅ ESM-C 600M model loaded successfully! Hidden size: {self.hidden_size}")
-        print(f"📏 Max sequence length: {self.max_sequence_length}")
+        print(f"🔍 Will extract embeddings from layer {layer_index if layer_index is not None else 'last'}")
     
     @torch.no_grad()
     def _compute_esmc_embedding(self, sequences: list):
@@ -166,38 +150,31 @@ class ESMCInference:
         return padded_embeddings
     
     @torch.no_grad()
-    def generate_embeddings(self, sequences: list, batch_size: int = 32, return_pooled: bool = False, max_sequence_length: int = None):
+    def generate_embeddings(self, sequences: list, return_pooled: bool = False):
         """
-        Generate embeddings for a list of sequences.
-        This method provides compatibility with ModelInference.generate_embeddings interface.
-        
+        Generate ESM-C embeddings for a list of sequences from the specified layer.
+
         @param sequences: List of protein sequences (strings)
-        @param batch_size: Batch size for inference
-        @param return_pooled: If True, return pooled embeddings (mean pooling). 
-                             If False, return sequence-level embeddings (all token embeddings)
-        @param max_sequence_length: Maximum sequence length (for compatibility, not used)
-        @returns: Tensor of embeddings with shape (num_sequences, hidden_size) if return_pooled=True,
-                 or (num_sequences, seq_len, hidden_size) if return_pooled=False
+        @param return_pooled: If True, return pooled embeddings (mean pooling).
+                             If False, return per-position embeddings
+        @returns: List of tensors, each with shape (seq_len, hidden_size) if return_pooled=False,
+                 or list of tensors with shape (hidden_size,) if return_pooled=True
         """
         all_embeddings = []
-        
-        # Process in batches
-        for i in tqdm(range(0, len(sequences), batch_size), desc="Generating embeddings"):
-            batch_sequences = sequences[i:i + batch_size]
-            
+
+        for seq in tqdm(sequences, desc=f"Generating ESM-C embeddings (layer {self.layer_index or 'last'})"):
             # Compute embeddings using ESM-C
-            batch_embeddings = self._compute_esmc_embedding(batch_sequences)  # [batch_size, seq_len, hidden_size]
-            
+            embeddings = self._compute_esmc_embedding([seq])  # [1, seq_len, hidden_size]
+            embeddings = embeddings.squeeze(0)  # [seq_len, hidden_size]
+
             if return_pooled:
                 # Mean pooling over sequence length
-                pooled_embeddings = batch_embeddings.mean(dim=1)  # [batch_size, hidden_size]
-                all_embeddings.append(pooled_embeddings.cpu())
+                pooled = embeddings.mean(dim=0)  # [hidden_size]
+                all_embeddings.append(pooled.cpu())
             else:
-                all_embeddings.append(batch_embeddings.cpu())
-        
-        # Concatenate all batches
-        embeddings = torch.cat(all_embeddings, dim=0)
-        return embeddings
+                all_embeddings.append(embeddings.cpu())
+
+        return all_embeddings
     
     @torch.no_grad()
     def generate_per_position_embeddings(self, sequences: list, batch_size: int = 32, 

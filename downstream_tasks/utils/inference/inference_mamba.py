@@ -9,26 +9,27 @@ import torch
 from tqdm import tqdm
 import esm
 
-from getters.tokenizer import PTMTokenizer
-from utils.checkpoint import load_ckpt
-from utils.esm_utils import make_esm_input_ids
+from main_pipeline.getters.tokenizer import PTMTokenizer
+from main_pipeline.utils.checkpoint import load_ckpt
+from main_pipeline.utils.esm_utils import make_esm_input_ids
 
 
-class ModelInference:
+class MambaInference:
     """
-    Model inference class for generating embeddings from pre-trained Mamba model.
+    Mamba model inference class for generating embeddings from pre-trained Mamba model.
     Supports Mamba-only or Mamba+ESM2-15B combination (matching training setup).
     This class is shared across all downstream tasks.
     """
     
-    def __init__(self, checkpoint_path: str, device: str = None, max_sequence_length: int = None, 
-                 use_esm: bool = True, esm2_model_name: str = "facebook/esm2_t48_15B_UR50D"):
+    def __init__(self, checkpoint_path: str, device: str = None, max_sequence_length: int = None,
+                 use_esm: bool = True, esm2_model_name: str = "facebook/esm2_t48_15B_UR50D",
+                 layer_index: int = None):
         """
         Initialize the inference model.
-        
+
         @param checkpoint_path: Path to the trained model checkpoint (.ckpt file)
         @param device: Device to run inference on (None for auto-detect)
-        @param max_sequence_length: Maximum sequence length for tokenization. 
+        @param max_sequence_length: Maximum sequence length for tokenization.
                                    If None, sequences will not be truncated (may cause memory issues).
                                    Default: 512 (matching training config)
         @param use_esm: If True, load ESM2 and use Mamba+ESM2 combination (matching training).
@@ -36,6 +37,8 @@ class ModelInference:
         @param esm2_model_name: ESM2 model name. Options:
                                - "facebook/esm2_t48_15B_UR50D" (default, 15B parameters)
                                - "facebook/esm2_t33_650M_UR50D" (650M parameters)
+        @param layer_index: Layer index to extract embeddings from (0-based).
+                           If None, uses last layer (default: None)
         """
         # Determine device
         if device is None:
@@ -78,6 +81,11 @@ class ModelInference:
                 print(f"   Auto-switching to {detected_esm_model_name} to match checkpoint configuration.")
             esm2_model_name = detected_esm_model_name
         
+        # Set layer index for extraction
+        self.layer_index = layer_index
+        if layer_index is not None:
+            print(f"🔍 Will extract embeddings from layer {layer_index} (0-based)")
+
         # Load ESM2 if use_esm is True (matching training setup)
         self.use_esm = use_esm
         self.esm_model = None
@@ -329,8 +337,13 @@ class ModelInference:
         # Generate embeddings using model with ESM embeddings (matching training)
         # The model will project ESM embeddings through esm_head first, then fuse with Mamba embeddings
         # Note: Use model() instead of model.backbone() to ensure esm_head projection is applied
-        model_outputs = self.model(input_ids, embedding=esm_embedding)
-        hidden_states = model_outputs.hidden_states
+        model_outputs = self.model(input_ids, embedding=esm_embedding, output_hidden_states=self.layer_index is not None)
+        if self.layer_index is not None:
+            # Extract from specific layer: layer_index=0 is first transformer layer
+            hidden_states = model_outputs.hidden_states[self.layer_index]
+        else:
+            # Use last hidden state (default behavior)
+            hidden_states = model_outputs.hidden_states
         
         # Extract per-position embeddings (remove CLS and EOS tokens)
         # 🔧 Fix: Simply remove CLS (position 0) and EOS, get embeddings for all sequence positions
@@ -469,7 +482,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Initialize inference model
-    inferencer = ModelInference(args.checkpoint)
+    inferencer = MambaInference(args.checkpoint)
     
     # Generate embeddings
     embeddings = inferencer.generate_embeddings(

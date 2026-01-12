@@ -7,9 +7,7 @@ import pandas as pd
 import argparse
 import os
 from pathlib import Path
-from tqdm import tqdm
 import sys
-import yaml
 
 # Add current directory to path for local imports
 current_dir = Path(__file__).parent
@@ -24,30 +22,24 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Try to import all inference classes from shared inference directory
-try:
-    from inference import ModelInference
-    MAMBA_AVAILABLE = True
-except ImportError:
-    MAMBA_AVAILABLE = False
+# Import ESM inference classes
+from inference_esm2 import ESM2Inference
+from inference_esmc import ESMCInference
 
-try:
-    from inference_esm2 import ESM2Inference
-    ESM2_AVAILABLE = True
-except ImportError:
-    ESM2_AVAILABLE = False
 
-try:
-    from inference_lora import LoRAInference
-    LORA_AVAILABLE = True
-except ImportError:
-    LORA_AVAILABLE = False
+def infer_model_type(pretrained_model_name: str) -> str:
+    """
+    根据预训练模型名称推断模型类型。
 
-try:
-    from inference_esmc import ESMCInference
-    ESMC_AVAILABLE = True
-except ImportError:
-    ESMC_AVAILABLE = False
+    @param pretrained_model_name: 预训练模型名称
+    @return: 模型类型 ('esm2' 或 'esmc')
+    """
+    if 'esm2' in pretrained_model_name.lower():
+        return 'esm2'
+    elif 'esmc' in pretrained_model_name.lower() or 'esm_c' in pretrained_model_name.lower():
+        return 'esmc'
+    else:
+        raise ValueError(f"无法从模型名称 '{pretrained_model_name}' 推断模型类型。只支持ESM2和ESMC模型")
 
 
 def load_data(data_path: str):
@@ -86,23 +78,24 @@ def load_data(data_path: str):
 def save_embeddings_data(embeddings_list, labels, sequences, output_dir: str, split_name: str):
     """
     Save embeddings, labels, and sequences to disk.
-    
+
     @param embeddings_list: List of per-position embeddings (each is a tensor)
     @param labels: List of label strings
     @param sequences: List of sequence strings
-    @param output_dir: Output directory
+    @param output_dir: Output directory (should be task-specific subdirectory)
     @param split_name: Name of the split (train/test/valid)
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
+    # Simple filenames since model info is in directory structure
     embeddings_path = os.path.join(output_dir, f"{split_name}_embeddings.pt")
     labels_path = os.path.join(output_dir, f"{split_name}_labels.pt")
     sequences_path = os.path.join(output_dir, f"{split_name}_sequences.pt")
-    
+
     torch.save(embeddings_list, embeddings_path)
     torch.save(labels, labels_path)
     torch.save(sequences, sequences_path)
-    
+
     print(f"✅ Saved {split_name} embeddings to {embeddings_path}")
     print(f"✅ Saved {split_name} labels to {labels_path}")
     print(f"✅ Saved {split_name} sequences to {sequences_path}")
@@ -111,53 +104,16 @@ def save_embeddings_data(embeddings_list, labels, sequences, output_dir: str, sp
 def main():
     parser = argparse.ArgumentParser(description="Generate embeddings for downstream task")
     parser.add_argument(
-        "--model_type",
+        "--pretrained_model_name",
         type=str,
-        default="mamba",
-        choices=["mamba", "esm2", "lora", "esmc"],
-        help="Model type to use: 'mamba', 'esm2', 'lora', or 'esmc' (default: mamba)"
-    )
-    parser.add_argument(
-        "--checkpoint", 
-        type=str, 
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction/best.ckpt",
-        help="Path to model checkpoint (for Mamba model)"
-    )
-    parser.add_argument(
-        "--esm2_model_name",
-        type=str,
-        default="facebook/esm2_t30_150M_UR50D",
-        help="ESM2 model name from HuggingFace (default: facebook/esm2_t30_150M_UR50D for ESM-C 600)"
+        default=None,
+        help="Pretrained model name from HuggingFace. If None, uses default ESM2 model."
     )
     parser.add_argument(
         "--layer_index",
         type=int,
         default=None,
         help="Layer index to extract (1-based for esmc, 0-based for esm2). If None, uses last layer (default: None)"
-    )
-    parser.add_argument(
-        "--train_data",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction/PhosphositePTM.train.txt",
-        help="Path to training data CSV"
-    )
-    parser.add_argument(
-        "--test_data",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction/PhosphositePTM.test.txt",
-        help="Path to test data CSV"
-    )
-    parser.add_argument(
-        "--valid_data",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction/PhosphositePTM.valid.txt",
-        help="Path to validation data CSV"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs/p_site_prediction",
-        help="Output directory. Embeddings will be stored in output_dir/embeddings/"
     )
     parser.add_argument(
         "--batch_size",
@@ -183,91 +139,81 @@ def main():
     parser.add_argument(
         "--window_overlap",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Overlap ratio between sliding windows (0.0 to 1.0). "
-             "Default 0.5 means 50%% overlap. Higher overlap provides better context but requires more computation."
-    )
-    parser.add_argument(
-        "--use_esm",
-        action="store_true",
-        default=False,
-        help="If set, load ESM2-15B and use Mamba+ESM2 combination (matching training setup). "
-             "If not set, use Mamba-only mode. (Default: False)"
+             "Default 0.3 means 30%% overlap. Higher overlap provides better context but requires more computation."
     )
     
     args = parser.parse_args()
-    
-    # Automatically create embeddings subdirectory in output_dir
-    embeddings_dir = os.path.join(args.output_dir, "embeddings")
-    os.makedirs(embeddings_dir, exist_ok=True)
-    print(f"📁 Embeddings will be stored in: {embeddings_dir}")
-    
-    # Initialize inference model based on model_type
-    print(f"\n🚀 Initializing {args.model_type.upper()} model inference...")
-    if args.model_type == "mamba":
-        if not MAMBA_AVAILABLE:
-            raise ImportError("Mamba inference not available. Please ensure inference.py exists.")
-        # Use Mamba+ESM2-15B combination if use_esm is True, otherwise use Mamba-only
-        inferencer = ModelInference(
-            args.checkpoint, 
-            max_sequence_length=args.max_sequence_length,
-            use_esm=args.use_esm  # Control whether to load ESM2-15B
-        )
-    elif args.model_type == "esm2":
-        if not ESM2_AVAILABLE:
-            raise ImportError("ESM2 inference not available. Please install transformers: pip install transformers")
+
+    # Set default pretrained model name
+    if args.pretrained_model_name is None:
+        args.pretrained_model_name = "facebook/esm2_t30_150M_UR50D"
+
+    # Infer model type from pretrained model name
+    model_type = infer_model_type(args.pretrained_model_name)
+    print(f"🔍 Inferred model type: {model_type} from {args.pretrained_model_name}")
+
+    # Create model-specific directory structure
+    model_short_name = args.pretrained_model_name.replace('/', '_').replace('facebook_', '').replace('esm2_', 'esm2-').replace('esm_', 'esm-')
+    layer_suffix = f"layer{args.layer_index}" if args.layer_index is not None else "last"
+    model_layer_dir = f"{model_short_name}_{layer_suffix}"
+
+    # Create task-specific subdirectory
+    output_dir = os.path.join(os.getcwd(), "embeddings")
+    task_dir = os.path.join(output_dir, model_layer_dir, "p_site")
+    os.makedirs(task_dir, exist_ok=True)
+    print(f"📁 Embeddings will be stored in: {task_dir}")
+
+    # Fixed data paths for phosphorylation site prediction
+    train_data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/p_site_prediction/PhosphositePTM.train.txt"
+    test_data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/p_site_prediction/PhosphositePTM.test.txt"
+    valid_data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/p_site_prediction/PhosphositePTM.valid.txt"
+
+    # Initialize inference model based on inferred model_type
+    print(f"\n🚀 Initializing {model_type.upper()} model inference...")
+    if model_type == "esm2":
         inferencer = ESM2Inference(
-            model_name=args.esm2_model_name,
-            max_sequence_length=args.max_sequence_length,
+            model_name=args.pretrained_model_name,
             layer_index=args.layer_index
         )
-    elif args.model_type == "lora":
-        if not LORA_AVAILABLE:
-            raise ImportError("LoRA inference not available. Please ensure inference_lora.py exists.")
-        inferencer = LoRAInference(
-            args.checkpoint,
-            max_sequence_length=args.max_sequence_length
-        )
-    elif args.model_type == "esmc":
-        if not ESMC_AVAILABLE:
-            raise ImportError("ESM-C inference not available. Please install fair-esm: pip install fair-esm")
+    elif model_type == "esmc":
         inferencer = ESMCInference(
-            max_sequence_length=args.max_sequence_length,
             layer_index=args.layer_index
         )
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba', 'esm2', 'lora', or 'esmc'.")
+        raise ValueError(f"Unknown model_type: {model_type}. Choose 'esm2' or 'esmc'.")
     
     # Process training data
     process_split(
-        args.train_data,
+        train_data_path,
         "train",
         inferencer,
-        embeddings_dir,
+        task_dir,
         args.batch_size,
         args.max_sequence_length,
         args.use_sliding_window,
         args.window_overlap
     )
-    
+
     # Process test data
     process_split(
-        args.test_data,
+        test_data_path,
         "test",
         inferencer,
-        embeddings_dir,
+        task_dir,
         args.batch_size,
         args.max_sequence_length,
         args.use_sliding_window,
         args.window_overlap
     )
-    
+
     # Process validation data
     process_split(
-        args.valid_data,
+        valid_data_path,
         "valid",
         inferencer,
-        embeddings_dir,
+        task_dir,
         args.batch_size,
         args.max_sequence_length,
         args.use_sliding_window,
@@ -317,25 +263,9 @@ def process_split(
             print(f"⚠️  No sequences found in {split_name} data, skipping...")
             return
         
-        # Generate embeddings
+        # Generate per-position embeddings for ESM2/ESMC
         print(f"\n🔄 Generating embeddings for {len(sequences)} sequences...")
-        # LoRA 使用不同的方法名
-        if hasattr(inferencer, 'generate_per_position_block_outputs'):
-            embeddings, lengths = inferencer.generate_per_position_block_outputs(
-                sequences,
-                batch_size=batch_size,
-                max_sequence_length=max_sequence_length,
-                use_sliding_window=use_sliding_window,
-                window_overlap=window_overlap
-            )
-        else:
-            embeddings, lengths = inferencer.generate_per_position_embeddings(
-                sequences,
-                batch_size=batch_size,
-                max_sequence_length=max_sequence_length,
-                use_sliding_window=use_sliding_window,
-                window_overlap=window_overlap
-            )
+        embeddings = inferencer.generate_embeddings(sequences, return_pooled=False)
             
         # Verify embeddings match sequences
         if len(embeddings) != len(sequences):

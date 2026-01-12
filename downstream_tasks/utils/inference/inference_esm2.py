@@ -112,86 +112,43 @@ class ESM2Inference:
         return hidden_states, attention_mask
     
     @torch.no_grad()
-    def generate_embeddings(self, sequences: list, batch_size: int = 32, return_pooled: bool = False, max_sequence_length: int = None):
+    def generate_embeddings(self, sequences: list, return_pooled: bool = False):
         """
-        Generate embeddings for a list of sequences.
-        This method provides compatibility with ModelInference.generate_embeddings interface.
-        
+        Generate ESM2 embeddings for a list of sequences from the specified layer.
+
         @param sequences: List of protein sequences (strings)
-        @param batch_size: Batch size for inference
-        @param return_pooled: If True, return pooled embeddings (mean pooling). 
-                             If False, return sequence-level embeddings (all token embeddings)
-        @param max_sequence_length: Maximum sequence length for tokenization. 
-                                   If None, uses the instance's max_sequence_length
-        @returns: Tensor of embeddings with shape (num_sequences, hidden_size) if return_pooled=True,
-                 or (num_sequences, seq_len, hidden_size) if return_pooled=False
+        @param return_pooled: If True, return pooled embeddings (mean pooling).
+                             If False, return per-position embeddings
+        @returns: List of tensors, each with shape (seq_len, hidden_size) if return_pooled=False,
+                 or list of tensors with shape (hidden_size,) if return_pooled=True
         """
         all_embeddings = []
-        
-        # Use provided max_sequence_length or fall back to instance default
-        max_seq_len = max_sequence_length if max_sequence_length is not None else self.max_sequence_length
-        
-        # Process in batches
-        for i in tqdm(range(0, len(sequences), batch_size), desc="Generating embeddings"):
-            batch_sequences = sequences[i:i + batch_size]
-            
-            # Tokenize and generate embeddings using shared helper method
-            hidden_states, attention_mask = self._tokenize_and_forward(batch_sequences, max_seq_len)
-            
-            if return_pooled:
-                # Mean pooling over sequence length (excluding special tokens and padding)
-                # Remove <cls> token (first token) and <eos>/<pad> tokens
-                # For each sequence, extract embeddings from position 1 to seq_len-1
-                pooled_embeddings = []
-                for hidden, attn_mask in zip(hidden_states, attention_mask):
-                    # Find the actual sequence length (excluding padding)
-                    seq_len = attn_mask.sum().item()
-                    # Extract sequence embeddings (remove <cls> at position 0 and <eos> at position seq_len-1)
-                    if seq_len > 2:
-                        seq_embeddings = hidden[1:seq_len-1]  # [seq_len-2, hidden_size]
-                        # Mean pooling over sequence length
-                        pooled = seq_embeddings.mean(dim=0)  # [hidden_size]
-                    elif seq_len == 2:
-                        # Only <cls> and <eos> tokens, use <cls> token embedding
-                        pooled = hidden[0]  # [hidden_size]
-                    else:
-                        # seq_len == 1, use the only token
-                        pooled = hidden[0]  # [hidden_size]
-                    pooled_embeddings.append(pooled)
-                
-                # Stack into batch tensor
-                batch_pooled = torch.stack(pooled_embeddings, dim=0)  # [batch_size, hidden_size]
-                all_embeddings.append(batch_pooled.cpu())
+
+        for seq in tqdm(sequences, desc=f"Generating ESM2 embeddings (layer {self.layer_index or 'last'})"):
+            # Tokenize and generate embeddings
+            hidden_states, attention_mask = self._tokenize_and_forward([seq])
+            hidden_states = hidden_states.squeeze(0)  # Remove batch dimension
+            attn_mask = attention_mask.squeeze(0)
+
+            # Find the actual sequence length (excluding padding)
+            seq_len = attn_mask.sum().item()
+
+            # Extract sequence embeddings (remove special tokens)
+            if seq_len > 2:
+                seq_embeddings = hidden_states[1:seq_len-1]  # Remove <cls> and <eos>
+            elif seq_len == 2:
+                seq_embeddings = hidden_states[0:1]  # Only <cls> token
             else:
-                # Return all token embeddings (remove special tokens)
-                batch_embeddings = []
-                for hidden, attn_mask in zip(hidden_states, attention_mask):
-                    seq_len = attn_mask.sum().item()
-                    if seq_len > 2:
-                        seq_embeddings = hidden[1:seq_len-1]  # [seq_len-2, hidden_size]
-                    elif seq_len == 2:
-                        # Only <cls> and <eos> tokens, return empty or use <cls>
-                        seq_embeddings = hidden[0:1]  # [1, hidden_size]
-                    else:
-                        # seq_len == 1, use the only token
-                        seq_embeddings = hidden[0:1]  # [1, hidden_size]
-                    batch_embeddings.append(seq_embeddings)
-                
-                # Pad sequences to same length for batching
-                max_seq_len_in_batch = max(emb.shape[0] for emb in batch_embeddings)
-                padded_embeddings = []
-                for emb in batch_embeddings:
-                    if emb.shape[0] < max_seq_len_in_batch:
-                        padding = torch.zeros(max_seq_len_in_batch - emb.shape[0], self.hidden_size, device=emb.device)
-                        emb = torch.cat([emb, padding], dim=0)
-                    padded_embeddings.append(emb)
-                
-                batch_tensor = torch.stack(padded_embeddings, dim=0)  # [batch_size, max_seq_len, hidden_size]
-                all_embeddings.append(batch_tensor.cpu())
-        
-        # Concatenate all batches
-        embeddings = torch.cat(all_embeddings, dim=0)
-        return embeddings
+                seq_embeddings = hidden_states[0:1]  # Only one token
+
+            if return_pooled:
+                # Mean pooling over sequence length
+                pooled = seq_embeddings.mean(dim=0)  # [hidden_size]
+                all_embeddings.append(pooled.cpu())
+            else:
+                all_embeddings.append(seq_embeddings.cpu())
+
+        return all_embeddings
     
     @torch.no_grad()
     def generate_per_position_embeddings(self, sequences: list, batch_size: int = 32, 

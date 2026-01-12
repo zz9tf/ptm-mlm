@@ -14,7 +14,19 @@ import sys
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
-from load_data import load_nha_data, prepare_sequences_and_labels
+import sys
+import os
+import importlib.util
+
+# Import load_data from NHA_site_prediction directory
+nha_load_data_path = os.path.join(os.path.dirname(__file__), '..', '..', 'tasks', 'NHA_site_prediction', 'load_data.py')
+spec = importlib.util.spec_from_file_location("nha_load_data", nha_load_data_path)
+nha_load_data = importlib.util.module_from_spec(spec)
+sys.modules["nha_load_data"] = nha_load_data
+spec.loader.exec_module(nha_load_data)
+
+load_nha_data = nha_load_data.load_nha_data
+prepare_sequences_and_labels = nha_load_data.prepare_sequences_and_labels
 
 # Add main_pipeline to path (inference.py needs getters.tokenizer, utils.checkpoint, etc.)
 # These modules are still in main_pipeline
@@ -25,52 +37,33 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Try to import both inference classes from shared inference directory
-try:
-    from inference import ModelInference
-    MAMBA_AVAILABLE = True
-except ImportError:
-    MAMBA_AVAILABLE = False
+# Import ESM inference classes
+from inference_esm2 import ESM2Inference
+from inference_esmc import ESMCInference
 
-try:
-    from inference_esm2 import ESM2Inference
-    ESM2_AVAILABLE = True
-except ImportError:
-    ESM2_AVAILABLE = False
 
-try:
-    from inference_lora import LoRAInference
-    LORA_AVAILABLE = True
-except ImportError:
-    LORA_AVAILABLE = False
+def infer_model_type(pretrained_model_name: str) -> str:
+    """
+    根据预训练模型名称推断模型类型。
 
-try:
-    from inference_esmc import ESMCInference
-    ESMC_AVAILABLE = True
-except ImportError:
-    ESMC_AVAILABLE = False
+    @param pretrained_model_name: 预训练模型名称
+    @return: 模型类型 ('esm2' 或 'esmc')
+    """
+    if 'esm2' in pretrained_model_name.lower():
+        return 'esm2'
+    elif 'esmc' in pretrained_model_name.lower() or 'esm_c' in pretrained_model_name.lower():
+        return 'esmc'
+    else:
+        raise ValueError(f"无法从模型名称 '{pretrained_model_name}' 推断模型类型。只支持ESM2和ESMC模型")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate embeddings for NHA site prediction")
     parser.add_argument(
-        "--model_type",
+        "--pretrained_model_name",
         type=str,
-        default="mamba",
-        choices=["mamba", "esm2", "lora", "esmc"],
-        help="Model type to use: 'mamba', 'esm2', 'lora', or 'esmc' (default: mamba)"
-    )
-    parser.add_argument(
-        "--checkpoint", 
-        type=str, 
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/p_site_prediction/best.ckpt",
-        help="Path to model checkpoint (for Mamba model)"
-    )
-    parser.add_argument(
-        "--esm2_model_name",
-        type=str,
-        default="facebook/esm2_t30_150M_UR50D",
-        help="ESM2 model name from HuggingFace (default: facebook/esm2_t30_150M_UR50D for ESM-C 600)"
+        default=None,
+        help="Pretrained model name from HuggingFace. If None, uses default ESM2 model."
     )
     parser.add_argument(
         "--layer_index",
@@ -79,23 +72,11 @@ def main():
         help="Layer index to extract (1-based for esmc, 0-based for esm2). If None, uses last layer (default: None)"
     )
     parser.add_argument(
-        "--data",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/NHA_site_prediction/NHAC.csv",
-        help="Path to NHAC.csv file"
-    )
-    parser.add_argument(
         "--sequence_column",
         type=str,
         default=None,
         help="Column name for sequences. If None, will process all seq_* columns. "
              "If specified, will only process that column (default: None, process all)"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/home/zz/zheng/ptm-mlm/downstream_tasks/outputs/NHA_site_prediction",
-        help="Output directory. Embeddings will be stored in output_dir/embeddings/"
     )
     parser.add_argument(
         "--batch_size",
@@ -121,29 +102,39 @@ def main():
     parser.add_argument(
         "--window_overlap",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Overlap ratio between sliding windows (0.0 to 1.0). "
-             "Default 0.5 means 50%% overlap."
-    )
-    parser.add_argument(
-        "--use_esm",
-        action="store_true",
-        default=False,
-        help="If set, load ESM2-15B and use Mamba+ESM2 combination (matching training setup). "
-             "If not set, use Mamba-only mode. (Default: False, only valid when model_type='mamba')"
+             "Default 0.3 means 30%% overlap."
     )
     
     args = parser.parse_args()
-    
-    # Automatically create embeddings subdirectory in output_dir
-    embeddings_dir = os.path.join(args.output_dir, "embeddings")
-    os.makedirs(embeddings_dir, exist_ok=True)
-    print(f"📁 Embeddings will be stored in: {embeddings_dir}")
-    
+
+    # Set default pretrained model name
+    if args.pretrained_model_name is None:
+        args.pretrained_model_name = "facebook/esm2_t30_150M_UR50D"
+
+    # Infer model type from pretrained model name
+    model_type = infer_model_type(args.pretrained_model_name)
+    print(f"🔍 Inferred model type: {model_type} from {args.pretrained_model_name}")
+
+    # Create model-specific directory structure
+    model_short_name = args.pretrained_model_name.replace('/', '_').replace('facebook_', '').replace('esm2_', 'esm2-').replace('esm_', 'esm-')
+    layer_suffix = f"layer{args.layer_index}" if args.layer_index is not None else "last"
+    model_layer_dir = f"{model_short_name}_{layer_suffix}"
+
+    # Create task-specific subdirectory
+    output_dir = os.path.join(os.getcwd(), "embeddings")
+    task_dir = os.path.join(output_dir, model_layer_dir, "nhas")
+    os.makedirs(task_dir, exist_ok=True)
+    print(f"📁 Embeddings will be stored in: {task_dir}")
+
+    # Fixed data path for NHA
+    data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/NHA_site_prediction/NHAC.csv"
+
     # Load data (first load to detect sequence columns)
     print("📖 Loading NHA data...")
     # Load with a dummy column first to get the dataframe structure
-    df_temp = pd.read_csv(args.data)
+    df_temp = pd.read_csv(data_path)
     
     # Detect all sequence columns (columns starting with 'seq_')
     if args.sequence_column is None:
@@ -157,41 +148,19 @@ def main():
     if len(sequence_columns) == 0:
         raise ValueError("No sequence columns found in the data!")
     
-    # Initialize inference model based on model_type
-    print(f"\n🚀 Initializing {args.model_type.upper()} model inference...")
-    if args.model_type == "mamba":
-        if not MAMBA_AVAILABLE:
-            raise ImportError("Mamba inference not available. Please ensure inference.py exists.")
-        # Use Mamba+ESM2-15B combination if use_esm is True, otherwise use Mamba-only
-        inferencer = ModelInference(
-            args.checkpoint, 
-            max_sequence_length=args.max_sequence_length,
-            use_esm=args.use_esm  # Control whether to load ESM2-15B
-        )
-    elif args.model_type == "esm2":
-        if not ESM2_AVAILABLE:
-            raise ImportError("ESM2 inference not available. Please install transformers: pip install transformers")
+    # Initialize inference model based on inferred model_type
+    print(f"\n🚀 Initializing {model_type.upper()} model inference...")
+    if model_type == "esm2":
         inferencer = ESM2Inference(
-            model_name=args.esm2_model_name,
-            max_sequence_length=args.max_sequence_length,
+            model_name=args.pretrained_model_name,
             layer_index=args.layer_index
         )
-    elif args.model_type == "lora":
-        if not LORA_AVAILABLE:
-            raise ImportError("LoRA inference not available. Please ensure inference_lora.py exists.")
-        inferencer = LoRAInference(
-            args.checkpoint,
-            max_sequence_length=args.max_sequence_length
-        )
-    elif args.model_type == "esmc":
-        if not ESMC_AVAILABLE:
-            raise ImportError("ESM-C inference not available. Please install fair-esm: pip install fair-esm")
+    elif model_type == "esmc":
         inferencer = ESMCInference(
-            max_sequence_length=args.max_sequence_length,
             layer_index=args.layer_index
         )
     else:
-        raise ValueError(f"Unknown model_type: {args.model_type}. Choose 'mamba', 'esm2', 'lora', or 'esmc'.")
+        raise ValueError(f"Unknown model_type: {model_type}. Choose 'esm2' or 'esmc'.")
     
     # Initialize lists to collect all data from all sequence columns
     all_train_embeddings = []
@@ -211,7 +180,7 @@ def main():
         print("="*70)
         
         # Load data for this sequence column
-        train_df, valid_df, test_df = load_nha_data(args.data, seq_col)
+        train_df, valid_df, test_df = load_nha_data(data_path, seq_col)
         
         # Process training data
         print("\n" + "="*50)
@@ -231,25 +200,8 @@ def main():
             batch_sequences = train_sequences[i:i + args.batch_size]
             batch_labels = train_labels[i:i + args.batch_size]
             
-            # Generate per-position embeddings
-            # LoRA 和 ESM-C 使用不同的方法名
-            if args.model_type == "lora":
-                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
-            else:
-                # ESM-C and other models use generate_per_position_embeddings
-                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
+            # Generate per-position embeddings for ESM2/ESMC
+            batch_embeddings = inferencer.generate_embeddings(batch_sequences, return_pooled=False)
             
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]
@@ -285,24 +237,9 @@ def main():
             batch_sequences = valid_sequences[i:i + args.batch_size]
             batch_labels = valid_labels[i:i + args.batch_size]
             
-            # LoRA 使用不同的方法名，ESM-C 和其他模型使用 generate_per_position_embeddings
-            if args.model_type == "lora":
-                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
-            else:
-                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
-            
+            # Generate embeddings using the appropriate method for ESM2/ESMC
+            batch_embeddings = inferencer.generate_embeddings(batch_sequences, return_pooled=False)
+
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]
             for j, emb in enumerate(batch_embeddings):
@@ -337,23 +274,14 @@ def main():
             batch_sequences = test_sequences[i:i + args.batch_size]
             batch_labels = test_labels[i:i + args.batch_size]
             
-            # LoRA 使用不同的方法名，ESM-C 和其他模型使用 generate_per_position_embeddings
-            if args.model_type == "lora":
-                batch_embeddings, _ = inferencer.generate_per_position_block_outputs(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
-            else:
-                batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                    batch_sequences,
-                    batch_size=len(batch_sequences),
-                    max_sequence_length=args.max_sequence_length,
-                    use_sliding_window=args.use_sliding_window,
-                    window_overlap=args.window_overlap
-                )
+            # Generate per-position embeddings for ESM2/ESMC
+            batch_embeddings, _ = inferencer.generate_per_position_embeddings(
+                batch_sequences,
+                batch_size=len(batch_sequences),
+                max_sequence_length=args.max_sequence_length,
+                use_sliding_window=args.use_sliding_window,
+                window_overlap=args.window_overlap
+            )
             
             # Ensure embeddings, labels, and sequences are matched
             # Keep per-position embeddings: [seq_len, hidden_size]
@@ -407,28 +335,28 @@ def main():
     if test_length_dist:
         print(f"   Test length distribution: {dict(sorted(test_length_dist.items()))}")
     
-    # Save training data (in embeddings subdirectory)
-    train_emb_path = os.path.join(embeddings_dir, "train_embeddings.pt")
-    train_labels_path = os.path.join(embeddings_dir, "train_labels.pt")
-    train_seqs_path = os.path.join(embeddings_dir, "train_sequences.pt")
+    # Save training data
+    train_emb_path = os.path.join(task_dir, "train_embeddings.pt")
+    train_labels_path = os.path.join(task_dir, "train_labels.pt")
+    train_seqs_path = os.path.join(task_dir, "train_sequences.pt")
     torch.save(all_train_embeddings, train_emb_path)
     torch.save(all_train_labels, train_labels_path)
     torch.save(all_train_sequences, train_seqs_path)
     print(f"✅ Saved combined training data: {len(all_train_embeddings)} samples")
-    
-    # Save validation data (in embeddings subdirectory)
-    valid_emb_path = os.path.join(embeddings_dir, "valid_embeddings.pt")
-    valid_labels_path = os.path.join(embeddings_dir, "valid_labels.pt")
-    valid_seqs_path = os.path.join(embeddings_dir, "valid_sequences.pt")
+
+    # Save validation data
+    valid_emb_path = os.path.join(task_dir, "valid_embeddings.pt")
+    valid_labels_path = os.path.join(task_dir, "valid_labels.pt")
+    valid_seqs_path = os.path.join(task_dir, "valid_sequences.pt")
     torch.save(all_valid_embeddings, valid_emb_path)
     torch.save(all_valid_labels, valid_labels_path)
     torch.save(all_valid_sequences, valid_seqs_path)
     print(f"✅ Saved combined validation data: {len(all_valid_embeddings)} samples")
-    
-    # Save test data (in embeddings subdirectory)
-    test_emb_path = os.path.join(embeddings_dir, "test_embeddings.pt")
-    test_labels_path = os.path.join(embeddings_dir, "test_labels.pt")
-    test_seqs_path = os.path.join(embeddings_dir, "test_sequences.pt")
+
+    # Save test data
+    test_emb_path = os.path.join(task_dir, "test_embeddings.pt")
+    test_labels_path = os.path.join(task_dir, "test_labels.pt")
+    test_seqs_path = os.path.join(task_dir, "test_sequences.pt")
     torch.save(all_test_embeddings, test_emb_path)
     torch.save(all_test_labels, test_labels_path)
     torch.save(all_test_sequences, test_seqs_path)
