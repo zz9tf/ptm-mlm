@@ -1,44 +1,27 @@
 """
 Script to generate embeddings from pre-trained model for PPI prediction.
-This script processes training, validation, and test data to generate embeddings for binder, wt, and ptm sequences.
+This script processes training, validation, and test data to generate embeddings for binder and wt sequences.
 """
 import torch
 import pandas as pd
 import argparse
 import os
+import sys
 from pathlib import Path
 from tqdm import tqdm
-import sys
 
-# Add current directory to path for local imports
-current_dir = Path(__file__).parent
-sys.path.insert(0, str(current_dir))
+# Add paths to sys.path for imports
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(current_file.parent.parent / "inference"))
 
-import sys
-import os
-import importlib.util
-
-# Import load_data from ppi_prediction directory
-ppi_load_data_path = os.path.join(os.path.dirname(__file__), '..', '..', 'tasks', 'ppi_prediction', 'load_data.py')
-spec = importlib.util.spec_from_file_location("ppi_load_data", ppi_load_data_path)
-ppi_load_data = importlib.util.module_from_spec(spec)
-sys.modules["ppi_load_data"] = ppi_load_data
-spec.loader.exec_module(ppi_load_data)
-
-load_ppi_data = ppi_load_data.load_ppi_data
-prepare_sequences_and_labels = ppi_load_data.prepare_sequences_and_labels
-
-# Add main_pipeline to path (inference.py needs getters.tokenizer, utils.checkpoint, etc.)
-main_pipeline_path = Path(__file__).parent.parent.parent / "main_pipeline"
-sys.path.insert(0, str(main_pipeline_path))
-
-# Add inference directory to path for shared inference classes
-inference_dir = Path(__file__).parent.parent / "inference"
-sys.path.insert(0, str(inference_dir))
-
-# Import ESM inference classes
-from inference_esm2 import ESM2Inference
-from inference_esmc import ESMCInference
+# Import from downstream_tasks
+from downstream_tasks.tasks.ppi_prediction.load_data import (
+    load_ppi_data,
+    prepare_sequences_and_labels_for_embedding_generation
+)
+from downstream_tasks.utils.inference.embedding_generator_inference import EmbeddingGeneratorInference
 
 
 def infer_model_type(pretrained_model_name: str) -> str:
@@ -48,12 +31,7 @@ def infer_model_type(pretrained_model_name: str) -> str:
     @param pretrained_model_name: 预训练模型名称
     @return: 模型类型 ('esm2' 或 'esmc')
     """
-    if 'esm2' in pretrained_model_name.lower():
-        return 'esm2'
-    elif 'esmc' in pretrained_model_name.lower() or 'esm_c' in pretrained_model_name.lower():
-        return 'esmc'
-    else:
-        raise ValueError(f"无法从模型名称 '{pretrained_model_name}' 推断模型类型。只支持ESM2和ESMC模型")
+    return EmbeddingGeneratorInference.infer_model_type(pretrained_model_name)
 
 
 def main():
@@ -156,20 +134,33 @@ def main():
         random_seed=args.random_seed
     )
     
-    # Initialize inference model based on inferred model_type
-    print(f"\n🚀 Initializing {model_type.upper()} model inference...")
-    if model_type == "esm2":
-        inferencer = ESM2Inference(
+    # 🔧 PPI任务特殊处理：
+    # - binder和wt：使用final layer（最后一层）生成embeddings（original）
+    # - PTM：使用WT序列（original），但用specific layer（layer_index参数指定的层）生成embeddings，留给block处理
+    
+    # Initialize EmbeddingGeneratorInference for original sequences (final layer)
+    print(f"\n🚀 Initializing {model_type.upper()} embedding generator for original sequences (final layer)...")
+    original_inferencer = EmbeddingGeneratorInference(
+        model_type=model_type,
+        model_name=args.pretrained_model_name,
+        layer_index=None,  # None表示使用最后一层（final layer）
+        max_sequence_length=args.max_sequence_length
+    )
+    
+    # Initialize EmbeddingGeneratorInference for PTM sequences (specific layer)
+    # PTM使用WT序列，但用specific layer生成embeddings
+    if args.layer_index is not None:
+        print(f"\n🚀 Initializing {model_type.upper()} embedding generator for PTM sequences (layer {args.layer_index})...")
+        ptm_inferencer = EmbeddingGeneratorInference(
+            model_type=model_type,
             model_name=args.pretrained_model_name,
-            max_sequence_length=args.max_sequence_length,
-            layer_index=args.layer_index
-        )
-    elif model_type == "esmc":
-        inferencer = ESMCInference(
-            layer_index=args.layer_index
+            layer_index=args.layer_index,  # 使用specific layer
+            max_sequence_length=args.max_sequence_length
         )
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'esm2' or 'esmc'.")
+        # 如果layer_index为None，PTM也使用final layer
+        print(f"\n🚀 PTM will use final layer (same as original)...")
+        ptm_inferencer = original_inferencer
     
     # Process each split
     for split_name, df in [("train", train_df), ("valid", valid_df), ("test", test_df)]:
@@ -177,73 +168,109 @@ def main():
         print(f"🔄 Processing {split_name} data...")
         print("="*70)
         
-        # Prepare sequences and labels
-        binder_sequences, wt_sequences, ptm_sequences, labels = prepare_sequences_and_labels(df)
+        # 准备序列和标签（只生成原始序列，不生成PTM序列）
+        binder_sequences, wt_sequences, labels = prepare_sequences_and_labels_for_embedding_generation(df)
         
         if len(binder_sequences) == 0:
             print(f"⚠️  No valid samples in {split_name} set, skipping...")
             continue
         
         print(f"📊 Processing {len(binder_sequences)} samples...")
+        print(f"ℹ️  Binder and WT embeddings: final layer (original)")
+        print(f"ℹ️  PTM embeddings: layer {args.layer_index if args.layer_index is not None else 'final'} (using WT sequences)")
         
-        # Generate embeddings for binder sequences
-        print(f"\n🔹 Generating binder embeddings...")
-        binder_embeddings_list = []
-        # Use pooled embeddings for PPI prediction
-        generate_method = inferencer.generate_embeddings
-        for i in tqdm(range(0, len(binder_sequences), args.batch_size), desc=f"Binder embeddings ({split_name})"):
-            batch_sequences = binder_sequences[i:i + args.batch_size]
-            batch_embeddings = generate_method(
-                batch_sequences,
-                return_pooled=True
+        # 🔧 优化：根据layer_index决定生成策略
+        if args.layer_index is None:
+            # layer_index为None：所有embeddings都使用final layer，分别生成
+            print(f"\n🔹 Generating binder embeddings (final layer)...")
+            binder_embeddings_tensor, binder_metadata_list, _ = original_inferencer.generate_batch_embeddings(
+                binder_sequences,
+                batch_size=args.batch_size,
+                max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+                use_sliding_window=args.use_sliding_window,
+                window_overlap=args.window_overlap,
+                layer_indices=[None]  # None表示final layer，使用新接口
             )
-            # batch_embeddings shape: [batch_size, hidden_size]
-            for j in range(len(batch_sequences)):
-                binder_embeddings_list.append(batch_embeddings[j])
-        
-        # Generate embeddings for wt sequences
-        print(f"\n🔹 Generating wild-type embeddings...")
-        wt_embeddings_list = []
-        for i in tqdm(range(0, len(wt_sequences), args.batch_size), desc=f"WT embeddings ({split_name})"):
-            batch_sequences = wt_sequences[i:i + args.batch_size]
-            batch_embeddings = generate_method(
-                batch_sequences,
-                return_pooled=True
+            
+            print(f"\n🔹 Generating WT embeddings (final layer, will be reused for PTM)...")
+            wt_embeddings_tensor, wt_metadata_list, _ = original_inferencer.generate_batch_embeddings(
+                wt_sequences,
+                batch_size=args.batch_size,
+                max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+                use_sliding_window=args.use_sliding_window,
+                window_overlap=args.window_overlap,
+                layer_indices=[None]  # None表示final layer，使用新接口
             )
-            for j in range(len(batch_sequences)):
-                wt_embeddings_list.append(batch_embeddings[j])
-        
-        # Generate embeddings for ptm sequences
-        print(f"\n🔹 Generating PTM-modified embeddings...")
-        ptm_embeddings_list = []
-        for i in tqdm(range(0, len(ptm_sequences), args.batch_size), desc=f"PTM embeddings ({split_name})"):
-            batch_sequences = ptm_sequences[i:i + args.batch_size]
-            batch_embeddings = generate_method(
-                batch_sequences,
-                return_pooled=True
+            # PTM使用相同的embeddings和metadata
+            ptm_embeddings_tensor = wt_embeddings_tensor
+            ptm_metadata_list = wt_metadata_list
+            print(f"   ✅ PTM embeddings reused from WT (same layer)")
+        else:
+            # layer_index不是None：一次性生成final layer和specific layer的embeddings
+            print(f"\n🔹 Generating embeddings (multiple layers in one pass)...")
+            print(f"   - Binder: final layer")
+            print(f"   - WT: final layer")
+            print(f"   - PTM: layer {args.layer_index}")
+            
+            # 一次性生成binder的final layer embeddings
+            binder_embeddings_tensor, binder_metadata_list, _ = original_inferencer.generate_batch_embeddings(
+                binder_sequences,
+                batch_size=args.batch_size,
+                max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+                use_sliding_window=args.use_sliding_window,
+                window_overlap=args.window_overlap,
+                layer_indices=[None]  # None表示final layer
             )
-            for j in range(len(batch_sequences)):
-                ptm_embeddings_list.append(batch_embeddings[j])
+            
+            # 一次性生成WT的final layer和PTM的specific layer embeddings
+            layer_indices = [None, args.layer_index]  # None表示final layer
+            result_dict = original_inferencer.generate_batch_embeddings(
+                wt_sequences,
+                batch_size=args.batch_size,
+                max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+                use_sliding_window=args.use_sliding_window,
+                window_overlap=args.window_overlap,
+                layer_indices=layer_indices  # 一次性生成两层
+            )
+            
+            # 提取WT embeddings (final layer, layer_index=None)
+            wt_embeddings_tensor, wt_metadata_list, _ = result_dict[None]
+            
+            # 提取PTM embeddings (specific layer)
+            ptm_embeddings_tensor, ptm_metadata_list, _ = result_dict[args.layer_index]
         
         # Verify consistency
-        assert len(binder_embeddings_list) == len(wt_embeddings_list) == len(ptm_embeddings_list) == len(labels), \
-            f"Mismatch in {split_name}: binder={len(binder_embeddings_list)}, wt={len(wt_embeddings_list)}, " \
-            f"ptm={len(ptm_embeddings_list)}, labels={len(labels)}"
+        binder_num_seqs = max(meta['sequence_id'] for meta in binder_metadata_list) + 1
+        wt_num_seqs = max(meta['sequence_id'] for meta in wt_metadata_list) + 1
+        ptm_num_seqs = max(meta['sequence_id'] for meta in ptm_metadata_list) + 1
         
-        # Save embeddings
+        assert binder_num_seqs == wt_num_seqs == ptm_num_seqs == len(labels), \
+            f"Mismatch in {split_name}: binder={binder_num_seqs}, wt={wt_num_seqs}, " \
+            f"ptm={ptm_num_seqs}, labels={len(labels)}"
+        
+        # Save batch embeddings and metadata
         print(f"\n💾 Saving {split_name} embeddings...")
 
         binder_emb_path = os.path.join(task_dir, f"{split_name}_binder_embeddings.pt")
+        binder_metadata_path = os.path.join(task_dir, f"{split_name}_binder_embeddings_metadata.json")
         wt_emb_path = os.path.join(task_dir, f"{split_name}_wt_embeddings.pt")
+        wt_metadata_path = os.path.join(task_dir, f"{split_name}_wt_embeddings_metadata.json")
         ptm_emb_path = os.path.join(task_dir, f"{split_name}_ptm_embeddings.pt")
+        ptm_metadata_path = os.path.join(task_dir, f"{split_name}_ptm_embeddings_metadata.json")
         labels_path = os.path.join(task_dir, f"{split_name}_labels.pt")
         
-        torch.save(binder_embeddings_list, binder_emb_path)
-        torch.save(wt_embeddings_list, wt_emb_path)
-        torch.save(ptm_embeddings_list, ptm_emb_path)
+        torch.save(binder_embeddings_tensor, binder_emb_path)
+        EmbeddingGeneratorInference.save_metadata(binder_metadata_list, binder_metadata_path)
+        torch.save(wt_embeddings_tensor, wt_emb_path)
+        EmbeddingGeneratorInference.save_metadata(wt_metadata_list, wt_metadata_path)
+        torch.save(ptm_embeddings_tensor, ptm_emb_path)
+        EmbeddingGeneratorInference.save_metadata(ptm_metadata_list, ptm_metadata_path)
         torch.save(labels, labels_path)
         
         print(f"✅ Saved {split_name} data: {len(labels)} samples")
+        print(f"   - Binder embeddings (final layer): {len(binder_sequences)} sequences")
+        print(f"   - WT embeddings (final layer): {len(wt_sequences)} sequences")
+        print(f"   - PTM embeddings (layer {args.layer_index if args.layer_index is not None else 'final'}, using WT sequences): {len(wt_sequences)} sequences")
     
     print("\n" + "="*70)
     print("🎉 Embedding generation completed!")

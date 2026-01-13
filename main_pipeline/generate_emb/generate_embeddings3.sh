@@ -6,23 +6,14 @@ conda activate ptm
 cd /home/zz/zheng/ptm-mlm/main_pipeline
 
 # Exclude GPU 3, use GPUs 1,2,4,5 (will be mapped to 0,1,2,3 by CUDA_VISIBLE_DEVICES)
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="2"
 
-# PTM MASKED sequences
-# python generate_embeddings.py \
-#     --config configs/base.yaml \
-#     --output_dir embeddings \
-#     --batch_size 6 \
-#     --chunk_size_gb 10
-
-# Original sequences
+# Generate ESM embeddings for dataset
 # Model and repr_layer are read from configs/base.yaml (training.esm_model and training.repr_layer)
 # Dataset location is read from configs/base.yaml (preprocess.dataset_location)
+# Original sequence column 'ori_seq' is hardcoded in the script
 python generate_embeddings.py \
-    --config configs/base.yaml \
-    --use_original_sequence \
-    --original_sequence_column ori_seq \
-    --output_dir memmap_functional \
-    --batch_size 512 \
-    --chunk_size_gb 10 \
-    --functional_role
+    --config configs/functional_emb.yaml \
+    --output_dir datasets/embeddings/esm2_650m/32/memmap_functional \
+    --batch_size 256 \
+    --chunk_size_gb 10

@@ -236,16 +236,16 @@ def load_ppi_data(
     return train_df, valid_df, test_df
 
 
-def prepare_sequences_and_labels(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str], List[int]]:
+def prepare_sequences_and_labels_for_embedding_generation(df: pd.DataFrame) -> Tuple[List[str], List[str], List[int]]:
     """
-    Prepare sequences and labels from dataframe.
+    为embedding generation准备序列和标签。
+    只返回原始序列（binder和wt），不生成PTM序列。
     
     @param df: DataFrame with PPI data
-    @returns: Tuple of (binder_sequences, wt_sequences, ptm_sequences, labels)
+    @returns: Tuple of (binder_sequences, wt_sequences, labels)
     """
     binder_sequences = []
     wt_sequences = []
-    ptm_sequences = []
     labels = []
     
     for _, row in df.iterrows():
@@ -255,25 +255,12 @@ def prepare_sequences_and_labels(df: pd.DataFrame) -> Tuple[List[str], List[str]
         # Wild-type sequence (target protein)
         wt_seq = str(row['Uniprot_sequence']).strip()
         
-        # PTM-modified sequence
-        ptm_type = str(row['PTM']).strip()
-        site = int(row['Site'])
-        aa = str(row['AA']).strip()
-        
-        try:
-            ptm_seq = apply_ptm_modification(wt_seq, ptm_type, site, aa)
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to apply PTM modification for row {row.name}: {e}")
-            # Skip this row
-            continue
-        
         # Label (Enhance/Induce=1, Inhibit=0)
         label = int(row['label'])
         
         binder_sequences.append(binder_seq)
         wt_sequences.append(wt_seq)
-        ptm_sequences.append(ptm_seq)
         labels.append(label)
     
-    return binder_sequences, wt_sequences, ptm_sequences, labels
+    return binder_sequences, wt_sequences, labels
 

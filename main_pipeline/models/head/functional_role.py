@@ -51,24 +51,9 @@ class FunctionalRoleHead(nn.Module):
         @param **kwargs: Additional arguments
         @returns: Dictionary containing logits of shape (batch_size, output_size)
         """
-
-        def _check(name, x):
-            if x is None:
-                raise RuntimeError(f"{name} is None")
-            if not torch.isfinite(x).all():
-                bad = (~torch.isfinite(x)).nonzero(as_tuple=False)[:5]
-                raise RuntimeError(f"{name} has NaN/Inf, examples idx={bad.tolist()}")
-            m = x.detach().abs().max().item()
-            if m > 1e4:
-                print(f"[warn] {name} abs_max={m:.2e} (may overflow in fp16/bf16)")
-
         processed_features = processed.get("ptm_features", None)
         if processed_features is None:
             raise ValueError("ptm_features must be provided")
-
-        # before indexing
-        _check("features", features)
-        _check("processed_features", processed_features)
 
         # Extract features at PTM positions
         B, _, _ = features.shape
@@ -76,10 +61,6 @@ class FunctionalRoleHead(nn.Module):
 
         ptm_features_selected = features[b, functional_role_position]            # (B, D)
         ptm_processed_selected = processed_features[b, functional_role_position]  # (B, D)
-
-        # after selecting ptm vectors
-        _check("ptm_features_selected", ptm_features_selected)
-        _check("ptm_processed_selected", ptm_processed_selected)
 
         if self.mix_type == "concat":
             combined_features = torch.cat([ptm_features_selected, ptm_processed_selected], dim=-1)
@@ -91,14 +72,9 @@ class FunctionalRoleHead(nn.Module):
             combined_features = ptm_features_selected * gate + ptm_processed_selected * (1 - gate)
             combined_features = self.pre_ln(combined_features.float()).to(combined_features.dtype)
 
-        # after combine
-        _check("combined_features", combined_features)
-
         # Compute logits for masked positions
         logits = self.head(combined_features)  # (num_masked_positions, output_size)
 
-        # after head
-        _check("logits", logits)
         return {
             "logits": logits
         }

@@ -100,7 +100,12 @@ class LoRABCBlock(nn.Module):
         init.xavier_uniform_(self.attn_qkv.weight)
         init.xavier_uniform_(self.attn_out.weight)
     
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        attention_mask: torch.Tensor = None,
+        **kwargs
+    ) -> torch.Tensor:
         """
         Forward pass through LoRA block (Adapter-style with tiny self-attention).
 
@@ -118,6 +123,11 @@ class LoRABCBlock(nn.Module):
         - h': output
 
         @param x: Input tensor of shape (batch_size, seq_len, embed_dim)
+        @param attention_mask: Optional attention mask tensor for padding tokens.
+            - Shape: (batch_size, seq_len) - 2D padding mask
+            - Values: 1.0 for valid tokens, 0.0 for padding/masked tokens
+            - Padding tokens will be masked out (set to -inf) in attention computation
+            - Also supports (batch_size, seq_len, seq_len) for custom attention patterns
         @param **kwargs: Additional arguments (unused)
         @returns: Output tensor of shape (batch_size, seq_len, d_model)
         """
@@ -152,9 +162,48 @@ class LoRABCBlock(nn.Module):
         scale = self.head_dim ** -0.5
         attn_weights = (q @ k.transpose(-2, -1)) * scale
 
-        # Apply causal mask if specified
+        # Apply attention mask if provided (for padding tokens)
+        if attention_mask is not None:
+            # Handle different attention_mask shapes
+            if attention_mask.dim() == 2:
+                # (batch_size, seq_len): 2D padding mask
+                # Values: 1.0 = valid token, 0.0 = padding/masked token
+                # Convert to 2D attention mask: (batch_size, seq_len, seq_len)
+                # attn[i, j] is valid only if both token i (query) and token j (key) are valid
+                # Shape: (batch_size, seq_len) -> (batch_size, seq_len, 1) * (batch_size, 1, seq_len)
+                attention_mask_2d = attention_mask.unsqueeze(-1) * attention_mask.unsqueeze(-2)
+                # Expand to multi-head: (batch_size, num_heads, seq_len, seq_len)
+                attention_mask_2d = attention_mask_2d.unsqueeze(1).expand(
+                    batch_size, self.num_attn_heads, seq_len, seq_len
+                )
+                attention_mask = attention_mask_2d
+            elif attention_mask.dim() == 3:
+                # (batch_size, seq_len, seq_len): Custom 2D attention pattern mask
+                # Expand to multi-head: (batch_size, num_heads, seq_len, seq_len)
+                attention_mask = attention_mask.unsqueeze(1).expand(
+                    batch_size, self.num_attn_heads, seq_len, seq_len
+                )
+            elif attention_mask.dim() == 4:
+                # (batch_size, num_heads, seq_len, seq_len): Multi-head attention mask (use directly)
+                pass
+            else:
+                raise ValueError(
+                    f"attention_mask must have 2, 3, or 4 dimensions, got {attention_mask.dim()}"
+                )
+            
+            # Apply mask: positions with 0.0 (padding/masked) are set to -inf before softmax
+            attention_mask = attention_mask.to(dtype=attn_weights.dtype, device=attn_weights.device)
+            attn_weights = attn_weights.masked_fill(attention_mask == 0.0, float('-inf'))
+
+        # Apply causal mask if specified (after attention_mask, so causal takes precedence where both apply)
         if self.causal_attn:
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), 
+                diagonal=1
+            )
+            # Expand causal mask to (batch_size, num_heads, seq_len, seq_len)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            causal_mask = causal_mask.expand(batch_size, self.num_attn_heads, seq_len, seq_len)
             attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
 
         attn_weights = torch.softmax(attn_weights, dim=-1)

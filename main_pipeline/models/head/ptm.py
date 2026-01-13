@@ -40,22 +40,8 @@ class PTMHead(nn.Module):
         @param **kwargs: Additional arguments (unused)
         @returns: Logits of shape (batch_size, seq_len, vocab_size)
         """
-
-        def _check(name, x):
-            if x is None:
-                raise RuntimeError(f"{name} is None")
-            if not torch.isfinite(x).all():
-                bad = (~torch.isfinite(x)).nonzero(as_tuple=False)[:5]
-                raise RuntimeError(f"{name} has NaN/Inf, examples idx={bad.tolist()}")
-            m = x.detach().abs().max().item()
-            if m > 1e4:
-                print(f"[warn] {name} abs_max={m:.2e} (may overflow in fp16/bf16)")
-
-        _check("ptm_input_features", features)
         features = self.middle_layer(features)
-        _check("ptm_middle_features", features)
         logits = self.head(features)
-        _check("ptm_logits", logits)
 
         return {
             "logits": logits,
@@ -67,21 +53,39 @@ class PTMHead(nn.Module):
         logits: torch.Tensor,
         input_ids: torch.Tensor,
         device: torch.device,
+        attention_mask: torch.Tensor = None,
         **kwargs
     ) -> torch.Tensor:
         """
-        Compute loss at all positions (including non-PTM positions that should predict <not-PTM>).
+        Compute loss at positions where attention_mask is True.
 
         @param logits: Head output logits of shape (batch_size, seq_len, vocab_size)
         @param input_ids: Target token IDs of shape (batch_size, seq_len)
         @param device: Device for tensor operations
+        @param attention_mask: Attention mask of shape (batch_size, seq_len), where True indicates valid positions
         @param **kwargs: Additional arguments (unused)
         @returns: Scalar loss tensor
         """
-        # Compute loss at all positions, including padding positions (will be masked by pad_mask in training)
-        return F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            input_ids.view(-1),
-            reduction='mean'
-        )
+        # 🎯 使用 attention_mask 来过滤有效位置（如果提供）
+        if attention_mask is not None:
+            # attention_mask: (batch_size, seq_len), True 表示有效位置
+            valid_mask = attention_mask.view(-1)  # Flatten to (batch_size * seq_len,)
+            logits_flat = logits.view(-1, logits.size(-1))  # (batch_size * seq_len, vocab_size)
+            input_ids_flat = input_ids.view(-1)  # (batch_size * seq_len,)
+            
+            if valid_mask.any():
+                return F.cross_entropy(
+                    logits_flat[valid_mask],
+                    input_ids_flat[valid_mask],
+                    reduction='mean'
+                )
+            else:
+                return torch.tensor(0.0, device=device)
+        else:
+            # Fallback: 如果没有 attention_mask，使用原来的逻辑
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                input_ids.view(-1),
+                reduction='mean'
+            )
 

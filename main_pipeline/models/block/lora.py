@@ -77,7 +77,12 @@ class LoRABlock(nn.Module):
         # Dropout for LoRA adapters
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
     
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        attention_mask: torch.Tensor = None,
+        **kwargs
+    ) -> torch.Tensor:
         """
         Forward pass through LoRA block (Adapter-style).
         
@@ -94,6 +99,9 @@ class LoRABlock(nn.Module):
         - h': output
         
         @param x: Input tensor of shape (batch_size, seq_len, embed_dim)
+        @param attention_mask: Optional attention mask tensor of shape (batch_size, seq_len).
+                              Values should be 1 for unmasked tokens and 0 for masked tokens.
+                              If provided, only unmasked positions will contribute to LoRA adaptation.
         @param **kwargs: Additional arguments (unused)
         @returns: Output tensor of shape (batch_size, seq_len, d_model)
         """
@@ -104,18 +112,30 @@ class LoRABlock(nn.Module):
         # Step 1: Layer Normalization
         h_norm = self.layer_norm(x)  # (batch_size, seq_len, embed_dim)
         
-        # Step 2: Down projection: W_down(LN(h))
+        # Step 2: Skip masked positions in dim=1 (seq_len dimension)
+        # Zero out masked positions so they don't participate in LoRA computation
+        if attention_mask is not None:
+            # attention_mask: (batch_size, seq_len) -> (batch_size, seq_len, 1)
+            # Zero out masked positions in dim=1
+            mask_expanded = attention_mask.unsqueeze(-1).to(h_norm.dtype)
+            h_norm = h_norm * mask_expanded  # Masked positions become 0
+        
+        # Step 3: Down projection: W_down(LN(h))
         # h_norm: (batch_size, seq_len, embed_dim)
         # lora_down: (embed_dim, rank)
         # h_norm @ lora_down: (batch_size, seq_len, rank)
         h_down = self.dropout(h_norm) @ self.lora_down
         
-        # Step 3: Up projection: W_up(h_down)
+        # Step 4: Up projection: W_up(h_down)
         # h_down: (batch_size, seq_len, rank)
         # lora_up: (rank, d_model)
         # h_down @ lora_up: (batch_size, seq_len, d_model)
         delta_h = h_down @ self.lora_up  # △h
-        # Step 4: Residual connection: h' = h + △h
+        
+        # Masked positions already have delta_h = 0 (due to masked h_norm)
+        # No need to apply mask again here
+        
+        # Step 5: Residual connection: h' = h + △h
         # Scale delta_h by alpha/rank
         output = base_output + self.scaling * delta_h
         

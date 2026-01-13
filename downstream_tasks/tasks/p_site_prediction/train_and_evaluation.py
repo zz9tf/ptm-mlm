@@ -8,14 +8,15 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import argparse
 import os
+import sys
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import json
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
-    accuracy_score, 
-    precision_recall_fscore_support, 
+    accuracy_score,
+    precision_recall_fscore_support,
     roc_auc_score,
     average_precision_score,
     matthews_corrcoef,
@@ -24,6 +25,19 @@ from sklearn.metrics import (
 from libauc.losses import AUCMLoss
 
 from prediction_head import ClassificationHead
+
+# Add project root and downstream_tasks directory to sys.path for importing modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(current_dir, '..', '..', '..')
+downstream_tasks_dir = os.path.join(current_dir, '..', '..')
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if downstream_tasks_dir not in sys.path:
+    sys.path.insert(0, downstream_tasks_dir)
+
+# Import inference pipeline for dynamic embedding processing
+from utils.inference.inference_pipeline import InferencePipeline
 
 
 class CombinedLoss(nn.Module):
@@ -407,7 +421,9 @@ def main():
         "--batch_size",
         type=int,
         default=32,
-        help="Batch size for training"
+        help="Batch size for training and adaptor processing. "
+             "This parameter controls both the training DataLoader batch size and "
+             "the batch size used when processing embeddings through adaptor."
     )
     parser.add_argument(
         "--learning_rate",
@@ -433,57 +449,129 @@ def main():
         default=0.5,
         help="Weight (λ) for AUCMLoss in combined loss. Formula: loss = bce_loss + λ * auc_loss (default: 0.5)"
     )
-    
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Model name for dynamic embedding generation (e.g., 'EvolutionaryScale_esmc-600m-2024-12'). "
+             "When provided along with --layer_index and --adaptor_checkpoint, embeddings will be "
+             "loaded from embeddings/ directory and processed through adaptor."
+    )
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=None,
+        help="Layer index for dynamic embedding generation (e.g., 30). "
+             "Used together with --model_name and --adaptor_checkpoint."
+    )
+    parser.add_argument(
+        "--adaptor_checkpoint",
+        type=str,
+        default=None,
+        help="Adaptor checkpoint name (without .ckpt extension) for processing embeddings. "
+             "When provided with --model_name and --layer_index, enables dynamic embedding processing."
+    )
+
     args = parser.parse_args()
+    
+    # 🔧 Convert "None" string to None for adaptor_checkpoint
+    if args.adaptor_checkpoint is not None:
+        if args.adaptor_checkpoint.lower() in ['none', 'null', '']:
+            args.adaptor_checkpoint = None
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"📁 Output directory: {args.output_dir}")
-    
-    # Automatically find embeddings directory in output_dir
-    embeddings_dir = os.path.join(args.output_dir, "embeddings")
-    if not os.path.exists(embeddings_dir):
-        raise FileNotFoundError(
-            f"Embeddings directory not found: {embeddings_dir}\n"
-            f"Please run generate_embeddings.py first to generate embeddings in {embeddings_dir}"
-        )
-    print(f"📁 Embeddings directory: {embeddings_dir}")
-    
+
     # Set device
     device = torch.device(args.device)
     print(f"🔧 Using device: {device}")
-    
-    # Load embeddings and labels
-    print("📦 Loading embeddings and labels...")
-    train_embeddings = torch.load(os.path.join(embeddings_dir, "train_embeddings.pt"))
-    train_labels = torch.load(os.path.join(embeddings_dir, "train_labels.pt"))
-    train_sequences = torch.load(os.path.join(embeddings_dir, "train_sequences.pt"))
-    
-    print(f"✅ Loaded {len(train_embeddings)} training samples")
-    
-    # Load validation embeddings and labels if available
-    valid_embeddings = None
-    valid_labels = None
-    valid_emb_path = os.path.join(embeddings_dir, "valid_embeddings.pt")
-    valid_labels_path = os.path.join(embeddings_dir, "valid_labels.pt")
-    if os.path.exists(valid_emb_path) and os.path.exists(valid_labels_path):
-        valid_embeddings = torch.load(valid_emb_path)
-        valid_labels = torch.load(valid_labels_path)
-        print(f"✅ Loaded {len(valid_embeddings)} validation samples")
+
+    # Check if using new dynamic embedding processing
+    # 🔧 Allow adaptor_checkpoint to be None (means no adaptor processing)
+    use_dynamic_processing = (args.model_name is not None and
+                            args.layer_index is not None)
+
+    if use_dynamic_processing:
+        print("🔄 Using dynamic embedding processing...")
+        print(f"   Model: {args.model_name}, Layer: {args.layer_index}")
+        if args.adaptor_checkpoint is not None:
+            print(f"   Adaptor checkpoint: {args.adaptor_checkpoint}")
+        else:
+            print(f"   Adaptor checkpoint: None (using raw embeddings)")
+
+        # Initialize inference pipeline
+        pipeline = InferencePipeline()
+
+        # Prepare data using inference pipeline (with progress bar)
+        print("🔄 Preparing data for p_site training...")
+        processed_data = pipeline.prepare_data_for_training(
+            model_name=args.model_name,
+            layer_index=args.layer_index,
+            task_name="p_site",
+            adaptor_checkpoint=args.adaptor_checkpoint,
+            device=args.device,
+            batch_size=args.batch_size
+        )
+
+        # Extract processed embeddings and labels
+        train_embeddings = processed_data['train_embeddings']
+        train_labels = processed_data['train_labels']
+        valid_embeddings = processed_data.get('valid_embeddings')
+        valid_labels = processed_data.get('valid_labels')
+        test_embeddings = processed_data.get('test_embeddings')
+        test_labels = processed_data.get('test_labels')
+
+        # Load sequences separately (not processed through adaptor)
+        embeddings_base_path = pipeline.get_embeddings_path(args.model_name, args.layer_index) / "p_site"
+        print(f"✅ Loaded {len(train_embeddings)} training samples")
+
+        if valid_embeddings is not None:
+            print(f"✅ Loaded {len(valid_embeddings)} validation samples")
+        if test_embeddings is not None:
+            print(f"✅ Loaded {len(test_embeddings)} test samples")
     else:
-        print("⚠️  Validation embeddings not found. Will evaluate on training set only.")
-    
-    # Load test embeddings and labels if available (for final evaluation)
-    test_embeddings = None
-    test_labels = None
-    test_emb_path = os.path.join(embeddings_dir, "test_embeddings.pt")
-    test_labels_path = os.path.join(embeddings_dir, "test_labels.pt")
-    if os.path.exists(test_emb_path) and os.path.exists(test_labels_path):
-        test_embeddings = torch.load(test_emb_path)
-        test_labels = torch.load(test_labels_path)
-        print(f"✅ Loaded {len(test_embeddings)} test samples")
-    else:
-        print("ℹ️  Test embeddings not found. Will skip test evaluation.")
+        print("📦 Using legacy embedding loading from output_dir...")
+        # Legacy logic: load from output_dir/embeddings
+        embeddings_dir = os.path.join(args.output_dir, "embeddings")
+        if not os.path.exists(embeddings_dir):
+            raise FileNotFoundError(
+                f"Embeddings directory not found: {embeddings_dir}\n"
+                f"Please run generate_embeddings.py first to generate embeddings in {embeddings_dir}\n"
+                f"Or use --model_name, --layer_index, and --adaptor_checkpoint for dynamic processing."
+            )
+        print(f"📁 Embeddings directory: {embeddings_dir}")
+
+        # Load embeddings and labels
+        print("📦 Loading embeddings and labels...")
+        train_embeddings = torch.load(os.path.join(embeddings_dir, "train_embeddings.pt"), weights_only=False)
+        train_labels = torch.load(os.path.join(embeddings_dir, "train_labels.pt"), weights_only=False)
+
+        print(f"✅ Loaded {len(train_embeddings)} training samples")
+
+        # Load validation embeddings and labels if available
+        valid_embeddings = None
+        valid_labels = None
+        valid_emb_path = os.path.join(embeddings_dir, "valid_embeddings.pt")
+        valid_labels_path = os.path.join(embeddings_dir, "valid_labels.pt")
+        if os.path.exists(valid_emb_path) and os.path.exists(valid_labels_path):
+            valid_embeddings = torch.load(valid_emb_path, weights_only=False)
+            valid_labels = torch.load(valid_labels_path, weights_only=False)
+            print(f"✅ Loaded {len(valid_embeddings)} validation samples")
+        else:
+            print("⚠️  Validation embeddings not found. Will evaluate on training set only.")
+
+        # Load test embeddings and labels if available (for final evaluation)
+        test_embeddings = None
+        test_labels = None
+        test_emb_path = os.path.join(embeddings_dir, "test_embeddings.pt")
+        test_labels_path = os.path.join(embeddings_dir, "test_labels.pt")
+        if os.path.exists(test_emb_path) and os.path.exists(test_labels_path):
+            test_embeddings = torch.load(test_emb_path, weights_only=False)
+            test_labels = torch.load(test_labels_path, weights_only=False)
+            print(f"✅ Loaded {len(test_embeddings)} test samples")
+        else:
+            print("ℹ️  Test embeddings not found. Will skip test evaluation.")
     
     # Infer hidden_size from embeddings if not provided
     if args.hidden_size is None or args.hidden_size <= 0:

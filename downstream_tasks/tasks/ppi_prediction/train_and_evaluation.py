@@ -14,14 +14,28 @@ import numpy as np
 import json
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
-    accuracy_score, 
-    precision_recall_fscore_support, 
+    accuracy_score,
+    precision_recall_fscore_support,
     roc_auc_score,
     average_precision_score,
     matthews_corrcoef,
     confusion_matrix
 )
 from ppi import TransformerClassifier
+import sys
+
+# Add project root and downstream_tasks directory to sys.path for importing modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(current_dir, '..', '..', '..')
+downstream_tasks_dir = os.path.join(current_dir, '..', '..')
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if downstream_tasks_dir not in sys.path:
+    sys.path.insert(0, downstream_tasks_dir)
+
+# Import inference pipeline for dynamic embedding processing
+from utils.inference.inference_pipeline import InferencePipeline
 
 
 class CombinedLoss(nn.Module):
@@ -107,8 +121,6 @@ def collate_fn(batch):
     @returns: Tuple of (binder_embs, wt_embs, ptm_embs, labels)
     """
     binder_embs, wt_embs, ptm_embs, labels = zip(*batch)
-    
-    # Stack embeddings and labels
     binder_embs = torch.stack(binder_embs)  # [batch_size, hidden_size]
     wt_embs = torch.stack(wt_embs)  # [batch_size, hidden_size]
     ptm_embs = torch.stack(ptm_embs)  # [batch_size, hidden_size]
@@ -357,7 +369,9 @@ def main():
         "--batch_size",
         type=int,
         default=32,
-        help="Batch size for training"
+        help="Batch size for training and adaptor processing. "
+             "This parameter controls both the training DataLoader batch size and "
+             "the batch size used when processing embeddings through adaptor."
     )
     parser.add_argument(
         "--learning_rate",
@@ -377,65 +391,136 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use for training"
     )
-    
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="Model name for dynamic embedding generation (e.g., 'EvolutionaryScale_esmc-600m-2024-12'). "
+             "When provided along with --layer_index and --adaptor_checkpoint, embeddings will be "
+             "loaded from embeddings/ directory and processed through adaptor."
+    )
+    parser.add_argument(
+        "--layer_index",
+        type=int,
+        default=None,
+        help="Layer index for dynamic embedding generation (e.g., 30). "
+             "Used together with --model_name and --adaptor_checkpoint."
+    )
+    parser.add_argument(
+        "--adaptor_checkpoint",
+        type=str,
+        default=None,
+        help="Adaptor checkpoint name (without .ckpt extension) for processing embeddings. "
+             "When provided with --model_name and --layer_index, enables dynamic embedding processing."
+    )
+
     args = parser.parse_args()
+    
+    # 🔧 Convert "None" string to None for adaptor_checkpoint
+    if args.adaptor_checkpoint is not None:
+        if args.adaptor_checkpoint.lower() in ['none', 'null', '']:
+            args.adaptor_checkpoint = None
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"📁 Output directory: {args.output_dir}")
-    
-    # Automatically find embeddings directory in output_dir
-    embeddings_dir = os.path.join(args.output_dir, "embeddings")
-    if not os.path.exists(embeddings_dir):
-        raise FileNotFoundError(
-            f"Embeddings directory not found: {embeddings_dir}\n"
-            f"Please run generate_embeddings.py first to generate embeddings in {embeddings_dir}"
-        )
-    print(f"📁 Embeddings directory: {embeddings_dir}")
-    
+
     # Set device
     device = torch.device(args.device)
     print(f"🔧 Using device: {device}")
-    
-    # Load embeddings and labels
-    print("📦 Loading embeddings and labels...")
-    
-    # Load training data
-    train_binder_embeddings = torch.load(os.path.join(embeddings_dir, "train_binder_embeddings.pt"), weights_only=False)
-    train_wt_embeddings = torch.load(os.path.join(embeddings_dir, "train_wt_embeddings.pt"), weights_only=False)
-    train_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "train_ptm_embeddings.pt"), weights_only=False)
-    train_labels = torch.load(os.path.join(embeddings_dir, "train_labels.pt"), weights_only=False)
-    print(f"✅ Loaded {len(train_labels)} training samples")
-    
-    # Load validation data if available
-    valid_binder_embeddings = None
-    valid_wt_embeddings = None
-    valid_ptm_embeddings = None
-    valid_labels = None
-    valid_binder_path = os.path.join(embeddings_dir, "valid_binder_embeddings.pt")
-    if os.path.exists(valid_binder_path):
-        valid_binder_embeddings = torch.load(valid_binder_path, weights_only=False)
-        valid_wt_embeddings = torch.load(os.path.join(embeddings_dir, "valid_wt_embeddings.pt"), weights_only=False)
-        valid_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "valid_ptm_embeddings.pt"), weights_only=False)
-        valid_labels = torch.load(os.path.join(embeddings_dir, "valid_labels.pt"), weights_only=False)
-        print(f"✅ Loaded {len(valid_labels)} validation samples")
+
+    # Check if using new dynamic embedding processing
+    # 🔧 Allow adaptor_checkpoint to be None (means no adaptor processing)
+    use_dynamic_processing = (args.model_name is not None and
+                            args.layer_index is not None)
+
+    if use_dynamic_processing:
+        # Initialize inference pipeline
+        pipeline = InferencePipeline()
+
+        # Prepare data using inference pipeline (with progress bar)
+        print("🔄 Preparing data for ppi training...")
+        processed_data = pipeline.prepare_data_for_training(
+            model_name=args.model_name,
+            layer_index=args.layer_index,
+            batch_size=args.batch_size,
+            task_name="ppi",
+            adaptor_checkpoint=args.adaptor_checkpoint,
+            device=args.device
+        )
+
+        # Extract processed embeddings and labels
+        train_binder_embeddings = processed_data['train_binder_embeddings']
+        train_wt_embeddings = processed_data['train_wt_embeddings']
+        train_ptm_embeddings = processed_data['train_ptm_embeddings']
+        train_labels = processed_data['train_labels']
+
+        valid_binder_embeddings = processed_data.get('valid_binder_embeddings')
+        valid_wt_embeddings = processed_data.get('valid_wt_embeddings')
+        valid_ptm_embeddings = processed_data.get('valid_ptm_embeddings')
+        valid_labels = processed_data.get('valid_labels')
+
+        test_binder_embeddings = processed_data.get('test_binder_embeddings')
+        test_wt_embeddings = processed_data.get('test_wt_embeddings')
+        test_ptm_embeddings = processed_data.get('test_ptm_embeddings')
+        test_labels = processed_data.get('test_labels')
+
+        print(f"✅ Loaded {len(train_labels)} training samples")
+        if valid_labels is not None:
+            print(f"✅ Loaded {len(valid_labels)} validation samples")
+        if test_labels is not None:
+            print(f"✅ Loaded {len(test_labels)} test samples")
     else:
-        print("⚠️  Validation embeddings not found. Cannot save best model based on validation metrics.")
-    
-    # Load test data if available
-    test_binder_embeddings = None
-    test_wt_embeddings = None
-    test_ptm_embeddings = None
-    test_labels = None
-    test_binder_path = os.path.join(embeddings_dir, "test_binder_embeddings.pt")
-    if os.path.exists(test_binder_path):
-        test_binder_embeddings = torch.load(test_binder_path, weights_only=False)
-        test_wt_embeddings = torch.load(os.path.join(embeddings_dir, "test_wt_embeddings.pt"), weights_only=False)
-        test_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "test_ptm_embeddings.pt"), weights_only=False)
-        test_labels = torch.load(os.path.join(embeddings_dir, "test_labels.pt"), weights_only=False)
-        print(f"✅ Loaded {len(test_labels)} test samples")
-    else:
-        print("ℹ️  Test embeddings not found. Will skip test evaluation.")
+        print("📦 Using legacy embedding loading from output_dir...")
+        # Legacy logic: load from output_dir/embeddings
+        embeddings_dir = os.path.join(args.output_dir, "embeddings")
+        if not os.path.exists(embeddings_dir):
+            raise FileNotFoundError(
+                f"Embeddings directory not found: {embeddings_dir}\n"
+                f"Please run generate_embeddings.py first to generate embeddings in {embeddings_dir}\n"
+                f"Or use --model_name, --layer_index, and --adaptor_checkpoint for dynamic processing."
+            )
+        print(f"📁 Embeddings directory: {embeddings_dir}")
+
+        # Load embeddings and labels
+        print("📦 Loading embeddings and labels...")
+
+        # Load training data
+        train_binder_embeddings = torch.load(os.path.join(embeddings_dir, "train_binder_embeddings.pt"), weights_only=False)
+        train_wt_embeddings = torch.load(os.path.join(embeddings_dir, "train_wt_embeddings.pt"), weights_only=False)
+        train_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "train_ptm_embeddings.pt"), weights_only=False)
+        train_labels = torch.load(os.path.join(embeddings_dir, "train_labels.pt"), weights_only=False)
+        print(f"✅ Loaded {len(train_labels)} training samples")
+
+        # Load validation data if available
+        valid_binder_embeddings = None
+        valid_wt_embeddings = None
+        valid_ptm_embeddings = None
+        valid_labels = None
+        valid_binder_path = os.path.join(embeddings_dir, "valid_binder_embeddings.pt")
+        if os.path.exists(valid_binder_path):
+            valid_binder_embeddings = torch.load(valid_binder_path, weights_only=False)
+            valid_wt_embeddings = torch.load(os.path.join(embeddings_dir, "valid_wt_embeddings.pt"), weights_only=False)
+            valid_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "valid_ptm_embeddings.pt"), weights_only=False)
+            valid_labels = torch.load(os.path.join(embeddings_dir, "valid_labels.pt"), weights_only=False)
+            print(f"✅ Loaded {len(valid_labels)} validation samples")
+        else:
+            print("⚠️  Validation embeddings not found. Cannot save best model based on validation metrics.")
+
+        # Load test data if available
+        test_binder_embeddings = None
+        test_wt_embeddings = None
+        test_ptm_embeddings = None
+        test_labels = None
+        test_binder_path = os.path.join(embeddings_dir, "test_binder_embeddings.pt")
+        if os.path.exists(test_binder_path):
+            test_binder_embeddings = torch.load(test_binder_path, weights_only=False)
+            test_wt_embeddings = torch.load(os.path.join(embeddings_dir, "test_wt_embeddings.pt"), weights_only=False)
+            test_ptm_embeddings = torch.load(os.path.join(embeddings_dir, "test_ptm_embeddings.pt"), weights_only=False)
+            test_labels = torch.load(os.path.join(embeddings_dir, "test_labels.pt"), weights_only=False)
+            print(f"✅ Loaded {len(test_labels)} test samples")
+        else:
+            print("ℹ️  Test embeddings not found. Will skip test evaluation.")
     
     # Infer hidden_size from embeddings if not provided
     if args.hidden_size is None or args.hidden_size <= 0:
@@ -449,7 +534,20 @@ def main():
         else:
             raise ValueError("Cannot infer hidden_size from embeddings. Please provide --hidden_size")
     
+    # 🔧 Infer ptm hidden_size (may differ from binder/wt if adaptor changes dimension)
+    if len(train_ptm_embeddings) > 0:
+        if isinstance(train_ptm_embeddings[0], torch.Tensor):
+            ptm_hidden_size = train_ptm_embeddings[0].shape[-1]
+        else:
+            ptm_hidden_size = len(train_ptm_embeddings[0])
+        print(f"🔍 Inferred ptm_hidden_size from embeddings: {ptm_hidden_size}")
+    else:
+        ptm_hidden_size = args.hidden_size  # Fallback to same as binder/wt
+    
     # Create dataset and dataloader for training
+    print(f"📊 Dataset sizes: binder={len(train_binder_embeddings)}, wt={len(train_wt_embeddings)}, ptm={len(train_ptm_embeddings)}, labels={len(train_labels)}")
+    if len(train_binder_embeddings) > 0:
+        print(f"📐 Embedding shapes: binder={train_binder_embeddings[0].shape}, wt={train_wt_embeddings[0].shape}, ptm={train_ptm_embeddings[0].shape}")
     train_dataset = PPIDataset(train_binder_embeddings, train_wt_embeddings, train_ptm_embeddings, train_labels)
     train_dataloader = DataLoader(
         train_dataset,
@@ -481,43 +579,47 @@ def main():
         )
     
     # Initialize model
-    print(f"\n🏗️  Initializing TransformerClassifier...")
-    print(f"   Hidden size: {args.hidden_size}")
+    print(f"\n🏗️  Initializing PPIClassifier...")
+    print(f"   Binder/WT hidden size: {args.hidden_size}")
+    print(f"   PTM hidden size: {ptm_hidden_size}")
     print(f"   Max length: {args.max_length}")
     print(f"   Dropout: {args.dropout}")
     
-    # TransformerClassifier expects [batch_size, max_length] inputs
-    # But we have [batch_size, hidden_size] embeddings
-    # Need to project hidden_size to max_length
-    class EmbeddingProjector(nn.Module):
-        """Project embeddings from hidden_size to max_length."""
-        def __init__(self, hidden_size, max_length):
-            super().__init__()
-            self.projection = nn.Linear(hidden_size, max_length)
+    class PPIClassifier(nn.Module):
+        """
+        Unified PPI classification model with embedding projection and TransformerClassifier.
         
-        def forward(self, x):
-            # x: [batch_size, hidden_size]
-            return self.projection(x)  # [batch_size, max_length]
-    
-    projector = EmbeddingProjector(args.hidden_size, args.max_length).to(device)
-    model = TransformerClassifier(dropout_rate=args.dropout, max_length=args.max_length).to(device)
-    
-    # Wrap model with projector
-    class ProjectedModel(nn.Module):
-        """Wrapper to project embeddings before passing to TransformerClassifier."""
-        def __init__(self, projector, model):
+        @param binder_wt_hidden_size: Hidden size for binder and wt embeddings
+        @param ptm_hidden_size: Hidden size for ptm embeddings
+        @param max_length: Maximum sequence length for TransformerClassifier
+        @param dropout_rate: Dropout rate for TransformerClassifier
+        """
+        def __init__(self, binder_wt_hidden_size, ptm_hidden_size, max_length, dropout_rate):
             super().__init__()
-            self.projector = projector
-            self.model = model
+            self.binder_wt_projector = nn.Linear(binder_wt_hidden_size, max_length)
+            self.ptm_projector = nn.Linear(ptm_hidden_size, max_length)
+            self.classifier = TransformerClassifier(dropout_rate=dropout_rate, max_length=max_length)
         
         def forward(self, binder, wt, ptm):
-            # Project embeddings to max_length
-            binder = self.projector(binder)  # [batch_size, max_length]
-            wt = self.projector(wt)  # [batch_size, max_length]
-            ptm = self.projector(ptm)  # [batch_size, max_length]
-            return self.model(binder, wt, ptm)
+            """
+            Forward pass.
+            
+            @param binder: Binder embeddings [batch_size, binder_wt_hidden_size]
+            @param wt: Wild-type embeddings [batch_size, binder_wt_hidden_size]
+            @param ptm: PTM embeddings [batch_size, ptm_hidden_size]
+            @returns: Logits [batch_size]
+            """
+            binder = self.binder_wt_projector(binder)  # [batch_size, max_length]
+            wt = self.binder_wt_projector(wt)  # [batch_size, max_length]
+            ptm = self.ptm_projector(ptm)  # [batch_size, max_length]
+            return self.classifier(binder, wt, ptm)
     
-    model = ProjectedModel(projector, model).to(device)
+    model = PPIClassifier(
+        binder_wt_hidden_size=args.hidden_size,
+        ptm_hidden_size=ptm_hidden_size,
+        max_length=args.max_length,
+        dropout_rate=args.dropout
+    ).to(device)
     
     # Calculate class weights for imbalanced data
     pos_count = sum(train_labels)

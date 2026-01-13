@@ -22,9 +22,8 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Import ESM inference classes
-from inference_esm2 import ESM2Inference
-from inference_esmc import ESMCInference
+# Import EmbeddingGeneratorInference
+from embedding_generator_inference import EmbeddingGeneratorInference
 
 
 def infer_model_type(pretrained_model_name: str) -> str:
@@ -34,12 +33,7 @@ def infer_model_type(pretrained_model_name: str) -> str:
     @param pretrained_model_name: 预训练模型名称
     @return: 模型类型 ('esm2' 或 'esmc')
     """
-    if 'esm2' in pretrained_model_name.lower():
-        return 'esm2'
-    elif 'esmc' in pretrained_model_name.lower() or 'esm_c' in pretrained_model_name.lower():
-        return 'esmc'
-    else:
-        raise ValueError(f"无法从模型名称 '{pretrained_model_name}' 推断模型类型。只支持ESM2和ESMC模型")
+    return EmbeddingGeneratorInference.infer_model_type(pretrained_model_name)
 
 
 def load_data(data_path: str):
@@ -75,11 +69,12 @@ def load_data(data_path: str):
     return sequences, labels
 
 
-def save_embeddings_data(embeddings_list, labels, sequences, output_dir: str, split_name: str):
+def save_embeddings_data(embeddings_tensor, metadata_list, labels, sequences, output_dir: str, split_name: str):
     """
-    Save embeddings, labels, and sequences to disk.
+    Save batch embeddings tensor, metadata, labels, and sequences to disk.
 
-    @param embeddings_list: List of per-position embeddings (each is a tensor)
+    @param embeddings_tensor: Batch tensor of shape (total_items, max_seq_len, embed_dim)
+    @param metadata_list: List of metadata dicts
     @param labels: List of label strings
     @param sequences: List of sequence strings
     @param output_dir: Output directory (should be task-specific subdirectory)
@@ -87,16 +82,19 @@ def save_embeddings_data(embeddings_list, labels, sequences, output_dir: str, sp
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Simple filenames since model info is in directory structure
+    # Save batch tensor and metadata (for pipeline processing)
     embeddings_path = os.path.join(output_dir, f"{split_name}_embeddings.pt")
+    metadata_path = os.path.join(output_dir, f"{split_name}_embeddings_metadata.json")
     labels_path = os.path.join(output_dir, f"{split_name}_labels.pt")
     sequences_path = os.path.join(output_dir, f"{split_name}_sequences.pt")
 
-    torch.save(embeddings_list, embeddings_path)
+    torch.save(embeddings_tensor, embeddings_path)
+    EmbeddingGeneratorInference.save_metadata(metadata_list, metadata_path)
     torch.save(labels, labels_path)
     torch.save(sequences, sequences_path)
 
-    print(f"✅ Saved {split_name} embeddings to {embeddings_path}")
+    print(f"✅ Saved {split_name} embeddings tensor to {embeddings_path}")
+    print(f"✅ Saved {split_name} metadata to {metadata_path}")
     print(f"✅ Saved {split_name} labels to {labels_path}")
     print(f"✅ Saved {split_name} sequences to {sequences_path}")
 
@@ -170,19 +168,14 @@ def main():
     test_data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/p_site_prediction/PhosphositePTM.test.txt"
     valid_data_path = "/home/zz/zheng/ptm-mlm/downstream_tasks/tasks/p_site_prediction/PhosphositePTM.valid.txt"
 
-    # Initialize inference model based on inferred model_type
-    print(f"\n🚀 Initializing {model_type.upper()} model inference...")
-    if model_type == "esm2":
-        inferencer = ESM2Inference(
-            model_name=args.pretrained_model_name,
-            layer_index=args.layer_index
-        )
-    elif model_type == "esmc":
-        inferencer = ESMCInference(
-            layer_index=args.layer_index
-        )
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'esm2' or 'esmc'.")
+    # Initialize EmbeddingGeneratorInference
+    print(f"\n🚀 Initializing {model_type.upper()} embedding generator...")
+    inferencer = EmbeddingGeneratorInference(
+        model_type=model_type,
+        model_name=args.pretrained_model_name,
+        layer_index=args.layer_index,
+        max_sequence_length=args.max_sequence_length
+    )
     
     # Process training data
     process_split(
@@ -263,64 +256,33 @@ def process_split(
             print(f"⚠️  No sequences found in {split_name} data, skipping...")
             return
         
-        # Generate per-position embeddings for ESM2/ESMC
-        print(f"\n🔄 Generating embeddings for {len(sequences)} sequences...")
-        embeddings = inferencer.generate_embeddings(sequences, return_pooled=False)
-            
-        # Verify embeddings match sequences
-        if len(embeddings) != len(sequences):
-            raise RuntimeError(f"Length mismatch: {len(embeddings)} embeddings vs {len(sequences)} sequences")
+        # Generate batch embeddings and metadata
+        print(f"\n🔄 Generating batch embeddings for {len(sequences)} sequences...")
+        embeddings_tensor, metadata_list, original_lengths = inferencer.generate_batch_embeddings(
+            sequences,
+            batch_size=batch_size,
+            max_sequence_length=max_sequence_length if max_sequence_length else 512,
+            use_sliding_window=use_sliding_window,
+            window_overlap=window_overlap
+        )
         
-        # 🔧 Verify embeddings match sequences and labels
-        # After fixing tokenizer max_length issue, all lengths should match
-        aligned_embeddings = []
-        aligned_labels = []
-        aligned_sequences = []
+        # Verify metadata matches sequences
+        num_sequences_in_metadata = max(meta['sequence_id'] for meta in metadata_list) + 1
+        if num_sequences_in_metadata != len(sequences):
+            raise RuntimeError(
+                f"Metadata sequence count ({num_sequences_in_metadata}) != input sequences ({len(sequences)})"
+            )
         
         # Track statistics for debugging
         seq_lengths = [len(seq) for seq in sequences]
         max_seq_len = max(seq_lengths) if seq_lengths else 0
         min_seq_len = min(seq_lengths) if seq_lengths else 0
         print(f"📊 Sequence length stats: min={min_seq_len}, max={max_seq_len}, total={len(sequences)}")
+        print(f"📊 Embeddings tensor shape: {embeddings_tensor.shape}")
+        print(f"📊 Metadata records: {len(metadata_list)}")
         
-        for idx, (emb, lab, seq) in enumerate(zip(embeddings, labels, sequences)):
-            lab_len = len(lab)  # Label length is the ground truth
-            emb_len = emb.shape[0]
-            seq_len = len(seq)
-            
-            # Verify sequence length matches label length (they should always match)
-            if seq_len != lab_len:
-                raise RuntimeError(
-                    f"Sequence length ({seq_len}) != label length ({lab_len}) at index {idx}/{len(sequences)}. "
-                    f"This indicates a data problem. Sequence: {seq[:50]}..., Label: {lab[:50]}..."
-                )
-            
-            # Verify embedding length matches label length
-            # This should not happen after fixing tokenizer max_length, but check for debugging
-            if emb_len != lab_len:
-                # 🔍 Detailed error info to help locate the problem
-                is_long_seq = seq_len > max_sequence_length if max_sequence_length else False
-                raise RuntimeError(
-                    f"❌ Embedding length mismatch at index {idx}/{len(sequences)}:\n"
-                    f"   - Embedding length: {emb_len}\n"
-                    f"   - Label length: {lab_len}\n"
-                    f"   - Sequence length: {seq_len}\n"
-                    f"   - Max sequence length setting: {max_sequence_length}\n"
-                    f"   - Sequence > max_length: {is_long_seq}\n"
-                    f"   - Using sliding window: {use_sliding_window}\n"
-                    f"   - Sequence preview: {seq[:100]}...\n"
-                    f"   - Label preview: {lab[:100]}...\n"
-                    f"This may indicate a bug in the inference code. "
-                    f"Please check tokenizer max_length settings (should be max_sequence_length + 2)."
-                )
-            
-            # All lengths match ✅
-            aligned_embeddings.append(emb)
-            aligned_labels.append(lab)
-            aligned_sequences.append(seq)
-        
-        # Save aligned data
-        save_embeddings_data(aligned_embeddings, aligned_labels, aligned_sequences, output_dir, split_name)
+        # Save batch tensor, metadata, labels, and sequences
+        save_embeddings_data(embeddings_tensor, metadata_list, labels, sequences, output_dir, split_name)
         
         print(f"\n✅ Successfully processed {split_name} data: {len(sequences)} samples")
         

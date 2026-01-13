@@ -7,8 +7,8 @@ Simple and direct: model(inputs) -> outputs
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any, List
-from models.block import build_block
-from models.head import build_head
+from .block import build_block
+from .head import build_head
 
 
 class PTMModel(nn.Module):
@@ -82,6 +82,7 @@ class PTMModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         embeddings: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
@@ -89,6 +90,8 @@ class PTMModel(nn.Module):
         
         @param input_ids: Input token IDs of shape (batch_size, seq_len), optional
         @param embeddings: ESM embeddings of shape (batch_size, seq_len, embed_dim), required
+        @param attention_mask: Attention mask of shape (batch_size, seq_len), optional
+            If not provided, defaults to all ones (all positions are valid)
         @param **kwargs: Additional arguments passed to block and heads
         @returns: Dictionary mapping head names to their logits
             Each value is of shape (batch_size, seq_len, vocab_size)
@@ -96,13 +99,17 @@ class PTMModel(nn.Module):
         if embeddings is None:
             raise ValueError("embeddings must be provided")
 
-        # Check input embeddings for NaN/Inf before processing
-        def _check0(name, t):
-            if not torch.isfinite(t).all():
-                bad = (~torch.isfinite(t)).nonzero(as_tuple=False)[:5]
-                raise RuntimeError(f"{name} NaN/Inf, idx={bad.tolist()}")
-
-        _check0("model_input_embeddings", embeddings)
+        # Create default attention_mask if not provided (all positions are valid)
+        if attention_mask is None:
+            batch_size, seq_len = embeddings.shape[:2]
+            attention_mask = torch.ones(
+                (batch_size, seq_len),
+                dtype=torch.bool,
+                device=embeddings.device
+            )
+        
+        # Add attention_mask to kwargs for block and heads
+        kwargs['attention_mask'] = attention_mask
 
         # Step 1: Process embeddings through block
         processed_features = self.block(embeddings, **kwargs)  # (batch_size, seq_len, d_model)

@@ -22,7 +22,7 @@ from utils.scheduler import Esm2LRScheduler
 from utils.config import load_config
 from utils.checkpoint import load_ckpt_from_output_dir
 from utils.esm_utils import get_esm_embed_dim
-from models.model import PTMModel
+from .models.model import PTMModel
 
 
 def get_last_training_metrics(metrics_path):
@@ -245,7 +245,7 @@ def train(
             # Get data from batch (already tokenized in collate_fn)
             # Embeddings 已经是 float16，只需传输到 device，保持原有精度
             embeddings = batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
-            pad_mask = batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len) 根据 range 生成，替代 pad_mask
             original_input_ids = batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             ptm_input_ids = batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
             if "functional_role_position" in batch:
@@ -263,7 +263,7 @@ def train(
             # 🚀 bf16 AMP: autocast 处理混合精度
             # Forward pass through model
             with accelerator.autocast():
-                outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor] - {head_name: logits}
+                outputs = model(embeddings=embeddings, attention_mask=attention_mask, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor] - {head_name: logits}
 
             # Get the actual model (handle accelerator wrapping)
             actual_model = model.module if hasattr(model, 'module') else model
@@ -275,6 +275,7 @@ def train(
                     "logits": logits,
                     "kwargs": {
                         "device": device,
+                        "attention_mask": attention_mask,  # 🎯 传递 attention_mask，只在有效位置计算 loss
                     }
                 }
                 if head_type == "original":
@@ -301,15 +302,24 @@ def train(
             head_accs = {}
             for head_type, logits in outputs.items():
                 if head_type == "original":
-                    # Accuracy at all non-padding positions
-                    non_padding_mask = pad_mask & (original_input_ids != 0)
-                    if non_padding_mask.any():
-                        acc = (logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
+                    # 🎯 Accuracy at positions where attention_mask is True
+                    # attention_mask 已经根据 range 数据正确生成，包含了所有有效位置
+                    if attention_mask.any():
+                        acc = (logits.argmax(dim=-1) == original_input_ids)[attention_mask].float().mean()
                     else:
                         acc = torch.tensor(0.0, device=device)
                 elif head_type == "ptm":
-                    # Accuracy at PTM positions only
-                    acc = (logits.argmax(dim=-1) == ptm_input_ids).float().mean()
+                    # 🎯 Accuracy at PTM positions where attention_mask is True
+                    if attention_mask.any():
+                        valid_mask = attention_mask.view(-1)
+                        logits_flat = logits.view(-1, logits.size(-1))
+                        ptm_ids_flat = ptm_input_ids.view(-1)
+                        if valid_mask.any():
+                            acc = (logits_flat.argmax(dim=-1) == ptm_ids_flat)[valid_mask].float().mean()
+                        else:
+                            acc = torch.tensor(0.0, device=device)
+                    else:
+                        acc = (logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                 else:
                     acc = torch.tensor(0.0, device=device)
                 head_accs[head_type] = acc
@@ -377,7 +387,7 @@ def train(
             
             # Clean up batch variables after logging
             del outputs, losses_compute_related, losses, head_accs, preplexity, acc, ptm_acc, total_loss
-            del embeddings, pad_mask, original_input_ids, ptm_input_ids
+            del embeddings, attention_mask, original_input_ids, ptm_input_ids
             
             # Removed frequent empty_cache() calls - only clear at epoch/validation end
             
@@ -402,7 +412,7 @@ def train(
                         # Get data from batch (already tokenized in collate_fn)
                         # Embeddings 已经是 float16，只需传输到 device，保持原有精度
                         embeddings = val_batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
-                        pad_mask = val_batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                        attention_mask = val_batch["attention_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len) 根据 range 生成，替代 pad_mask
                         original_input_ids = val_batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
                         ptm_input_ids = val_batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
 
@@ -417,7 +427,7 @@ def train(
                         # 🚀 bf16 AMP: autocast 处理混合精度
                         # Forward pass through model
                         with accelerator.autocast():
-                            outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
+                            outputs = model(embeddings=embeddings, attention_mask=attention_mask, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                         # Get the actual model (handle accelerator wrapping)
                         actual_model = model.module if hasattr(model, 'module') else model
@@ -429,6 +439,7 @@ def train(
                                 "logits": logits,
                                 "kwargs": {
                                     "device": device,
+                                    "attention_mask": attention_mask,  # 🎯 传递 attention_mask，只在有效位置计算 loss
                                 }
                             }
                             if head_type == "original":
@@ -454,16 +465,28 @@ def train(
                         original_logits = outputs.get("original", None)
                         ptm_logits = outputs.get("ptm", None)
                         
-                        # Accuracy on original (at non-padding positions)
-                        non_padding_mask = pad_mask & (original_input_ids != 0)
-                        if non_padding_mask.any() and original_logits is not None:
-                            acc = (original_logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
+                        # 🎯 Accuracy on original (at positions where attention_mask is True)
+                        # attention_mask 已经根据 range 数据正确生成，包含了所有有效位置
+                        if original_logits is not None:
+                            if attention_mask.any():
+                                acc = (original_logits.argmax(dim=-1) == original_input_ids)[attention_mask].float().mean()
+                            else:
+                                acc = torch.tensor(0.0, device=device)
                         else:
                             acc = torch.tensor(0.0, device=device)
                         
-                        # Compute PTM accuracy on ptm at PTM sites
+                        # 🎯 Compute PTM accuracy at positions where attention_mask is True
                         if ptm_logits is not None:
-                            ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
+                            if attention_mask.any():
+                                valid_mask = attention_mask.view(-1)
+                                logits_flat = ptm_logits.view(-1, ptm_logits.size(-1))
+                                ptm_ids_flat = ptm_input_ids.view(-1)
+                                if valid_mask.any():
+                                    ptm_acc = (logits_flat.argmax(dim=-1) == ptm_ids_flat)[valid_mask].float().mean()
+                                else:
+                                    ptm_acc = torch.tensor(0.0, device=device)
+                            else:
+                                ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                         else:
                             ptm_acc = torch.tensor(0.0, device=device)
                     
@@ -496,9 +519,9 @@ def train(
                         )
                     
                     # Clean up validation batch variables
-                    del embeddings, pad_mask, original_input_ids, ptm_input_ids
+                    del embeddings, attention_mask, original_input_ids, ptm_input_ids
                     del outputs, losses_compute_related, losses, original_logits, ptm_logits
-                    del acc, ptm_acc, preplexity, loss, non_padding_mask
+                    del acc, ptm_acc, preplexity, loss
                 
                 # Clean up validation variables (empty_cache moved to epoch end)
                 
@@ -623,7 +646,7 @@ def train(
                     # Get data from batch (already tokenized in collate_fn)
                     # Embeddings 已经是 float16，只需传输到 device，保持原有精度
                     embeddings = test_batch["embeddings"].to(device=device, non_blocking=True)  # (batch_size, max_seq_len, embed_dim) float16
-                    pad_mask = test_batch["pad_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
+                    attention_mask = test_batch["attention_mask"].to(device, non_blocking=True)  # (batch_size, max_seq_len) 根据 range 生成，替代 pad_mask
                     original_input_ids = test_batch["original_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
                     ptm_input_ids = test_batch["ptm_input_ids"].to(device, non_blocking=True)  # (batch_size, max_seq_len)
 
@@ -637,7 +660,7 @@ def train(
                     # 🚀 bf16 AMP: autocast 处理混合精度
                     # Forward pass through model
                     with accelerator.autocast():
-                        outputs = model(embeddings=embeddings, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
+                        outputs = model(embeddings=embeddings, attention_mask=attention_mask, functional_role_position=functional_role_position)  # Dict[str, torch.Tensor]
 
                     # Get the actual model (handle accelerator wrapping)
                     actual_model = model.module if hasattr(model, 'module') else model
@@ -649,6 +672,7 @@ def train(
                             "logits": logits,
                             "kwargs": {
                                 "device": device,
+                                "attention_mask": attention_mask,  # 🎯 传递 attention_mask，只在有效位置计算 loss
                             }
                         }
                         if head_type == "original":
@@ -675,16 +699,28 @@ def train(
                     original_logits = outputs.get("original", None)
                     ptm_logits = outputs.get("ptm", None)
                     
-                    # Accuracy on original (at non-padding positions)
-                    non_padding_mask = pad_mask & (original_input_ids != 0)
-                    if non_padding_mask.any() and original_logits is not None:
-                        acc = (original_logits.argmax(dim=-1) == original_input_ids)[non_padding_mask].float().mean()
+                    # 🎯 Accuracy on original (at positions where attention_mask is True)
+                    # attention_mask 已经根据 range 数据正确生成，包含了所有有效位置
+                    if original_logits is not None:
+                        if attention_mask.any():
+                            acc = (original_logits.argmax(dim=-1) == original_input_ids)[attention_mask].float().mean()
+                        else:
+                            acc = torch.tensor(0.0, device=device)
                     else:
                         acc = torch.tensor(0.0, device=device)
                     
-                    # Compute PTM accuracy on ptm at PTM sites
+                    # 🎯 Compute PTM accuracy at positions where attention_mask is True
                     if ptm_logits is not None:
-                        ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
+                        if attention_mask.any():
+                            valid_mask = attention_mask.view(-1)
+                            logits_flat = ptm_logits.view(-1, ptm_logits.size(-1))
+                            ptm_ids_flat = ptm_input_ids.view(-1)
+                            if valid_mask.any():
+                                ptm_acc = (logits_flat.argmax(dim=-1) == ptm_ids_flat)[valid_mask].float().mean()
+                            else:
+                                ptm_acc = torch.tensor(0.0, device=device)
+                        else:
+                            ptm_acc = (ptm_logits.argmax(dim=-1) == ptm_input_ids).float().mean()
                     else:
                         ptm_acc = torch.tensor(0.0, device=device)
                 
@@ -1039,20 +1075,28 @@ def main():
         """
         优化后的 collate function：
         1. Stacks embeddings (保持 float16，避免不必要的转换)
-        2. 批量创建 pad_mask 和输入 tensors
-        3. 移除字符串对象以提高性能
+        2. 根据 range 数据生成 attention_mask
+        3. 批量创建输入 tensors
+        4. 移除字符串对象以提高性能
         """
         max_seq_len = batch[0]["embeddings"].shape[0]  # 所有样本都有相同形状
 
         # 批量堆叠 embeddings（保持原 dtype，让 bf16 AMP autocast 处理）
         embeddings = torch.stack([item["embeddings"] for item in batch])  # (batch_size, max_seq_len, embed_dim)
 
-        # 收集序列长度
-        seq_lengths = [item["seq_length"] for item in batch]
-
-        # 批量创建 pad_mask（向量化操作，比循环快）
-        seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
-        pad_mask = torch.arange(max_seq_len, device='cpu').unsqueeze(0) < seq_lengths_tensor.unsqueeze(1)  # (batch_size, max_seq_len)
+        # 🎯 根据 range 数据生成 attention_mask
+        # range 格式: [start, end, length]，其中 length (第三个元素) 表示完整序列的token数量（包含<cls>和<eos>）
+        # length 用于生成 attention_mask，确保模型只关注有效位置
+        range_list = [item.get("range", None) for item in batch]
+        if all(r is not None for r in range_list):
+            # 提取 length (range 的第三个元素，索引为 2)
+            # range 是 numpy.ndarray，shape (3,)，格式 [start, end, length]
+            valid_lens = torch.tensor([int(r[2]) for r in range_list], dtype=torch.long)  # (batch_size,)
+            # 生成 attention_mask: attention_mask[i, j] = True if j < valid_len[i]
+            attention_mask = torch.arange(max_seq_len, device='cpu').unsqueeze(0) < valid_lens.unsqueeze(1)  # (batch_size, max_seq_len)
+        else:
+            # 如果没有 range 数据，使用 seq_length 作为 fallback
+            raise ValueError("range data is required for attention mask generation")
 
         # 批量创建输入 tensors（避免逐个 copy）
         orig_ids_list = [item["orig_ids"] for item in batch]
@@ -1104,10 +1148,9 @@ def main():
         # 基础返回结构（移除字符串对象）
         result = {
             "embeddings": embeddings,  # float16 CPU tensor
-            "pad_mask": pad_mask,      # bool CPU tensor
+            "attention_mask": attention_mask,  # bool CPU tensor，根据 range 生成，替代 pad_mask
             "original_input_ids": original_input_ids,  # long CPU tensor
             "ptm_input_ids": ptm_input_ids,           # long CPU tensor
-            "seq_lengths": seq_lengths_tensor,         # (batch_size,) tensor
         }
 
         # 可选：只在需要时添加 unique_ids（从 protein_idx 映射）

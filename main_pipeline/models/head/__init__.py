@@ -4,9 +4,9 @@ Head module: Generate sequences from processed features.
 Each head is in a separate file for clarity.
 """
 
-from models.head.original import OriginalHead
-from models.head.ptm import PTMHead
-from models.head.functional_role import FunctionalRoleHead
+from .original import OriginalHead
+from .ptm import PTMHead
+from .functional_role import FunctionalRoleHead
 from typing import Dict, Any
 
 

@@ -4,7 +4,7 @@ Block module: Process embeddings/features.
 Each block is in a separate file for clarity.
 """
 
-from models.block.lora import LoRABlock
+from .lora import LoRABlock
 from typing import Dict, Any
 import torch.nn as nn
 

@@ -37,9 +37,8 @@ sys.path.insert(0, str(main_pipeline_path))
 inference_dir = Path(__file__).parent.parent / "inference"
 sys.path.insert(0, str(inference_dir))
 
-# Import ESM inference classes
-from inference_esm2 import ESM2Inference
-from inference_esmc import ESMCInference
+# Import EmbeddingGeneratorInference
+from embedding_generator_inference import EmbeddingGeneratorInference
 
 
 def infer_model_type(pretrained_model_name: str) -> str:
@@ -49,12 +48,7 @@ def infer_model_type(pretrained_model_name: str) -> str:
     @param pretrained_model_name: 预训练模型名称
     @return: 模型类型 ('esm2' 或 'esmc')
     """
-    if 'esm2' in pretrained_model_name.lower():
-        return 'esm2'
-    elif 'esmc' in pretrained_model_name.lower() or 'esm_c' in pretrained_model_name.lower():
-        return 'esmc'
-    else:
-        raise ValueError(f"无法从模型名称 '{pretrained_model_name}' 推断模型类型。只支持ESM2和ESMC模型")
+    return EmbeddingGeneratorInference.infer_model_type(pretrained_model_name)
 
 
 def main():
@@ -148,28 +142,26 @@ def main():
     if len(sequence_columns) == 0:
         raise ValueError("No sequence columns found in the data!")
     
-    # Initialize inference model based on inferred model_type
-    print(f"\n🚀 Initializing {model_type.upper()} model inference...")
-    if model_type == "esm2":
-        inferencer = ESM2Inference(
-            model_name=args.pretrained_model_name,
-            layer_index=args.layer_index
-        )
-    elif model_type == "esmc":
-        inferencer = ESMCInference(
-            layer_index=args.layer_index
-        )
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'esm2' or 'esmc'.")
+    # Initialize EmbeddingGeneratorInference
+    print(f"\n🚀 Initializing {model_type.upper()} embedding generator...")
+    inferencer = EmbeddingGeneratorInference(
+        model_type=model_type,
+        model_name=args.pretrained_model_name,
+        layer_index=args.layer_index,
+        max_sequence_length=args.max_sequence_length
+    )
     
     # Initialize lists to collect all data from all sequence columns
-    all_train_embeddings = []
+    all_train_embeddings_tensors = []  # List of batch tensors
+    all_train_metadata_list = []  # List of metadata lists
     all_train_labels = []
     all_train_sequences = []
-    all_valid_embeddings = []
+    all_valid_embeddings_tensors = []
+    all_valid_metadata_list = []
     all_valid_labels = []
     all_valid_sequences = []
-    all_test_embeddings = []
+    all_test_embeddings_tensors = []
+    all_test_metadata_list = []
     all_test_labels = []
     all_test_sequences = []
     
@@ -188,38 +180,19 @@ def main():
         print("="*50)
         train_sequences, train_labels = prepare_sequences_and_labels(train_df, seq_col)
         
-        # For NHA prediction, we use per-position embeddings for GNN
-        # Each amino acid position will be a node in the graph
-        # Process sequences, labels, and embeddings together to ensure they match
-        print("Generating per-position embeddings for GNN...")
-        train_embeddings_list = []
-        train_labels_processed = []
-        train_sequences_processed = []
+        # Generate batch embeddings and metadata (for pipeline processing)
+        print("Generating batch embeddings and metadata...")
+        train_embeddings_tensor, train_metadata_list, _ = inferencer.generate_batch_embeddings(
+            train_sequences,
+            batch_size=args.batch_size,
+            max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+            use_sliding_window=args.use_sliding_window,
+            window_overlap=args.window_overlap
+        )
         
-        for i in tqdm(range(0, len(train_sequences), args.batch_size), desc="Training embeddings"):
-            batch_sequences = train_sequences[i:i + args.batch_size]
-            batch_labels = train_labels[i:i + args.batch_size]
-            
-            # Generate per-position embeddings for ESM2/ESMC
-            batch_embeddings = inferencer.generate_embeddings(batch_sequences, return_pooled=False)
-            
-            # Ensure embeddings, labels, and sequences are matched
-            # Keep per-position embeddings: [seq_len, hidden_size]
-            for j, emb in enumerate(batch_embeddings):
-                train_embeddings_list.append(emb)  # Shape: [seq_len, hidden_size]
-                train_labels_processed.append(batch_labels[j])
-                train_sequences_processed.append(batch_sequences[j])
-        
-        # Use processed lists
-        train_labels = train_labels_processed
-        train_sequences = train_sequences_processed
-        
-        # Verify consistency
-        assert len(train_embeddings_list) == len(train_labels) == len(train_sequences), \
-            f"Mismatch: embeddings={len(train_embeddings_list)}, labels={len(train_labels)}, sequences={len(train_sequences)}"
-        
-        # Add to overall lists
-        all_train_embeddings.extend(train_embeddings_list)
+        # Store batch tensor and metadata (will be saved later)
+        all_train_embeddings_tensors.append(train_embeddings_tensor)
+        all_train_metadata_list.extend(train_metadata_list)
         all_train_labels.extend(train_labels)
         all_train_sequences.extend(train_sequences)
         
@@ -229,34 +202,18 @@ def main():
         print("="*50)
         valid_sequences, valid_labels = prepare_sequences_and_labels(valid_df, seq_col)
         
-        valid_embeddings_list = []
-        valid_labels_processed = []
-        valid_sequences_processed = []
+        # Generate batch embeddings and metadata
+        valid_embeddings_tensor, valid_metadata_list, _ = inferencer.generate_batch_embeddings(
+            valid_sequences,
+            batch_size=args.batch_size,
+            max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+            use_sliding_window=args.use_sliding_window,
+            window_overlap=args.window_overlap
+        )
         
-        for i in tqdm(range(0, len(valid_sequences), args.batch_size), desc="Validation embeddings"):
-            batch_sequences = valid_sequences[i:i + args.batch_size]
-            batch_labels = valid_labels[i:i + args.batch_size]
-            
-            # Generate embeddings using the appropriate method for ESM2/ESMC
-            batch_embeddings = inferencer.generate_embeddings(batch_sequences, return_pooled=False)
-
-            # Ensure embeddings, labels, and sequences are matched
-            # Keep per-position embeddings: [seq_len, hidden_size]
-            for j, emb in enumerate(batch_embeddings):
-                valid_embeddings_list.append(emb)  # Shape: [seq_len, hidden_size]
-                valid_labels_processed.append(batch_labels[j])
-                valid_sequences_processed.append(batch_sequences[j])
-        
-        # Use processed lists
-        valid_labels = valid_labels_processed
-        valid_sequences = valid_sequences_processed
-        
-        # Verify consistency
-        assert len(valid_embeddings_list) == len(valid_labels) == len(valid_sequences), \
-            f"Mismatch: embeddings={len(valid_embeddings_list)}, labels={len(valid_labels)}, sequences={len(valid_sequences)}"
-        
-        # Add to overall lists
-        all_valid_embeddings.extend(valid_embeddings_list)
+        # Store batch tensor and metadata
+        all_valid_embeddings_tensors.append(valid_embeddings_tensor)
+        all_valid_metadata_list.extend(valid_metadata_list)
         all_valid_labels.extend(valid_labels)
         all_valid_sequences.extend(valid_sequences)
         
@@ -266,40 +223,18 @@ def main():
         print("="*50)
         test_sequences, test_labels = prepare_sequences_and_labels(test_df, seq_col)
         
-        test_embeddings_list = []
-        test_labels_processed = []
-        test_sequences_processed = []
+        # Generate batch embeddings and metadata
+        test_embeddings_tensor, test_metadata_list, _ = inferencer.generate_batch_embeddings(
+            test_sequences,
+            batch_size=args.batch_size,
+            max_sequence_length=args.max_sequence_length if args.max_sequence_length else 512,
+            use_sliding_window=args.use_sliding_window,
+            window_overlap=args.window_overlap
+        )
         
-        for i in tqdm(range(0, len(test_sequences), args.batch_size), desc="Test embeddings"):
-            batch_sequences = test_sequences[i:i + args.batch_size]
-            batch_labels = test_labels[i:i + args.batch_size]
-            
-            # Generate per-position embeddings for ESM2/ESMC
-            batch_embeddings, _ = inferencer.generate_per_position_embeddings(
-                batch_sequences,
-                batch_size=len(batch_sequences),
-                max_sequence_length=args.max_sequence_length,
-                use_sliding_window=args.use_sliding_window,
-                window_overlap=args.window_overlap
-            )
-            
-            # Ensure embeddings, labels, and sequences are matched
-            # Keep per-position embeddings: [seq_len, hidden_size]
-            for j, emb in enumerate(batch_embeddings):
-                test_embeddings_list.append(emb)  # Shape: [seq_len, hidden_size]
-                test_labels_processed.append(batch_labels[j])
-                test_sequences_processed.append(batch_sequences[j])
-        
-        # Use processed lists
-        test_labels = test_labels_processed
-        test_sequences = test_sequences_processed
-        
-        # Verify consistency
-        assert len(test_embeddings_list) == len(test_labels) == len(test_sequences), \
-            f"Mismatch: embeddings={len(test_embeddings_list)}, labels={len(test_labels)}, sequences={len(test_sequences)}"
-        
-        # Add to overall lists
-        all_test_embeddings.extend(test_embeddings_list)
+        # Store batch tensor and metadata
+        all_test_embeddings_tensors.append(test_embeddings_tensor)
+        all_test_metadata_list.extend(test_metadata_list)
         all_test_labels.extend(test_labels)
         all_test_sequences.extend(test_sequences)
     
@@ -308,65 +243,190 @@ def main():
     print("💾 Saving combined data from all sequence columns...")
     print("="*70)
     
+    # Concatenate all batch tensors from different sequence columns
+    print("\n📊 Concatenating batch tensors from all sequence columns...")
+    
+    # Concatenate training embeddings tensors
+    if len(all_train_embeddings_tensors) > 0:
+        # Update metadata embedding_idx and sequence_id with offsets before concatenation
+        train_offset = 0
+        train_seq_offset = 0
+        metadata_idx = 0
+        
+        # First pass: calculate sequence count for each tensor
+        # We need to know how many sequences each tensor has before we can update sequence_id
+        train_seq_counts = []
+        current_metadata_idx = 0
+        for tensor in all_train_embeddings_tensors:
+            tensor_size = tensor.shape[0]
+            # Get metadata for this tensor
+            tensor_metadata = all_train_metadata_list[current_metadata_idx:current_metadata_idx + tensor_size]
+            if tensor_metadata:
+                # Get max sequence_id in this tensor's metadata
+                max_seq_id = max(meta['sequence_id'] for meta in tensor_metadata)
+                seq_count = max_seq_id + 1  # sequence_id is 0-based, so count is max + 1
+                train_seq_counts.append(seq_count)
+            else:
+                train_seq_counts.append(0)
+            current_metadata_idx += tensor_size
+        
+        # Second pass: update metadata with offsets
+        metadata_idx = 0
+        for i, tensor in enumerate(all_train_embeddings_tensors):
+            tensor_size = tensor.shape[0]
+            
+            for j in range(tensor_size):
+                if metadata_idx < len(all_train_metadata_list):
+                    # Update embedding_idx
+                    all_train_metadata_list[metadata_idx]['embedding_idx'] += train_offset
+                    # Update sequence_id (shift by accumulated sequence count from previous columns)
+                    all_train_metadata_list[metadata_idx]['sequence_id'] += train_seq_offset
+                    metadata_idx += 1
+            
+            train_offset += tensor_size
+            train_seq_offset += train_seq_counts[i]
+        
+        # Concatenate tensors
+        all_train_embeddings_tensor = torch.cat(all_train_embeddings_tensors, dim=0)
+    else:
+        all_train_embeddings_tensor = None
+    
+    # Concatenate validation embeddings tensors
+    if len(all_valid_embeddings_tensors) > 0:
+        valid_offset = 0
+        valid_seq_offset = 0
+        metadata_idx = 0
+        
+        # Calculate sequence count for each tensor
+        valid_seq_counts = []
+        current_metadata_idx = 0
+        for tensor in all_valid_embeddings_tensors:
+            tensor_size = tensor.shape[0]
+            tensor_metadata = all_valid_metadata_list[current_metadata_idx:current_metadata_idx + tensor_size]
+            if tensor_metadata:
+                max_seq_id = max(meta['sequence_id'] for meta in tensor_metadata)
+                seq_count = max_seq_id + 1
+                valid_seq_counts.append(seq_count)
+            else:
+                valid_seq_counts.append(0)
+            current_metadata_idx += tensor_size
+        
+        # Update metadata with offsets
+        metadata_idx = 0
+        for i, tensor in enumerate(all_valid_embeddings_tensors):
+            tensor_size = tensor.shape[0]
+            
+            for j in range(tensor_size):
+                if metadata_idx < len(all_valid_metadata_list):
+                    all_valid_metadata_list[metadata_idx]['embedding_idx'] += valid_offset
+                    all_valid_metadata_list[metadata_idx]['sequence_id'] += valid_seq_offset
+                    metadata_idx += 1
+            
+            valid_offset += tensor_size
+            valid_seq_offset += valid_seq_counts[i]
+        
+        all_valid_embeddings_tensor = torch.cat(all_valid_embeddings_tensors, dim=0)
+    else:
+        all_valid_embeddings_tensor = None
+    
+    # Concatenate test embeddings tensors
+    if len(all_test_embeddings_tensors) > 0:
+        test_offset = 0
+        test_seq_offset = 0
+        metadata_idx = 0
+        
+        # Calculate sequence count for each tensor
+        test_seq_counts = []
+        current_metadata_idx = 0
+        for tensor in all_test_embeddings_tensors:
+            tensor_size = tensor.shape[0]
+            tensor_metadata = all_test_metadata_list[current_metadata_idx:current_metadata_idx + tensor_size]
+            if tensor_metadata:
+                max_seq_id = max(meta['sequence_id'] for meta in tensor_metadata)
+                seq_count = max_seq_id + 1
+                test_seq_counts.append(seq_count)
+            else:
+                test_seq_counts.append(0)
+            current_metadata_idx += tensor_size
+        
+        # Update metadata with offsets
+        metadata_idx = 0
+        for i, tensor in enumerate(all_test_embeddings_tensors):
+            tensor_size = tensor.shape[0]
+            
+            for j in range(tensor_size):
+                if metadata_idx < len(all_test_metadata_list):
+                    all_test_metadata_list[metadata_idx]['embedding_idx'] += test_offset
+                    all_test_metadata_list[metadata_idx]['sequence_id'] += test_seq_offset
+                    metadata_idx += 1
+            
+            test_offset += tensor_size
+            test_seq_offset += test_seq_counts[i]
+        
+        all_test_embeddings_tensor = torch.cat(all_test_embeddings_tensors, dim=0)
+    else:
+        all_test_embeddings_tensor = None
+    
     # Verify final consistency
-    assert len(all_train_embeddings) == len(all_train_labels) == len(all_train_sequences), \
-        f"Final train mismatch: embeddings={len(all_train_embeddings)}, labels={len(all_train_labels)}, sequences={len(all_train_sequences)}"
-    assert len(all_valid_embeddings) == len(all_valid_labels) == len(all_valid_sequences), \
-        f"Final valid mismatch: embeddings={len(all_valid_embeddings)}, labels={len(all_valid_labels)}, sequences={len(all_valid_sequences)}"
-    assert len(all_test_embeddings) == len(all_test_labels) == len(all_test_sequences), \
-        f"Final test mismatch: embeddings={len(all_test_embeddings)}, labels={len(all_test_labels)}, sequences={len(all_test_sequences)}"
+    # After updating sequence_id, the max sequence_id should match the total number of sequences
+    train_num_seqs = max(meta['sequence_id'] for meta in all_train_metadata_list) + 1 if all_train_metadata_list else 0
+    valid_num_seqs = max(meta['sequence_id'] for meta in all_valid_metadata_list) + 1 if all_valid_metadata_list else 0
+    test_num_seqs = max(meta['sequence_id'] for meta in all_test_metadata_list) + 1 if all_test_metadata_list else 0
     
-    # Print sequence length distribution for reference
-    print("\n📊 Sequence length distribution:")
-    train_lengths = [emb.shape[0] for emb in all_train_embeddings]
-    valid_lengths = [emb.shape[0] for emb in all_valid_embeddings] if len(all_valid_embeddings) > 0 else []
-    test_lengths = [emb.shape[0] for emb in all_test_embeddings] if len(all_test_embeddings) > 0 else []
+    assert train_num_seqs == len(all_train_labels) == len(all_train_sequences), \
+        f"Final train mismatch: sequences={train_num_seqs}, labels={len(all_train_labels)}, sequences={len(all_train_sequences)}"
+    assert valid_num_seqs == len(all_valid_labels) == len(all_valid_sequences), \
+        f"Final valid mismatch: sequences={valid_num_seqs}, labels={len(all_valid_labels)}, sequences={len(all_valid_sequences)}"
+    assert test_num_seqs == len(all_test_labels) == len(all_test_sequences), \
+        f"Final test mismatch: sequences={test_num_seqs}, labels={len(all_test_labels)}, sequences={len(all_test_sequences)}"
     
-    from collections import Counter
-    train_length_dist = Counter(train_lengths)
-    valid_length_dist = Counter(valid_lengths) if valid_lengths else {}
-    test_length_dist = Counter(test_lengths) if test_lengths else {}
-    
-    all_unique_lengths = set(train_lengths + valid_lengths + test_lengths)
-    print(f"   Found {len(all_unique_lengths)} different sequence lengths: {sorted(all_unique_lengths)}")
-    print(f"   Train length distribution: {dict(sorted(train_length_dist.items()))}")
-    if valid_length_dist:
-        print(f"   Valid length distribution: {dict(sorted(valid_length_dist.items()))}")
-    if test_length_dist:
-        print(f"   Test length distribution: {dict(sorted(test_length_dist.items()))}")
+    # Print statistics
+    print(f"\n📊 Final statistics:")
+    print(f"   Train: {train_num_seqs} sequences, {all_train_embeddings_tensor.shape[0] if all_train_embeddings_tensor is not None else 0} items in batch tensor")
+    print(f"   Valid: {valid_num_seqs} sequences, {all_valid_embeddings_tensor.shape[0] if all_valid_embeddings_tensor is not None else 0} items in batch tensor")
+    print(f"   Test: {test_num_seqs} sequences, {all_test_embeddings_tensor.shape[0] if all_test_embeddings_tensor is not None else 0} items in batch tensor")
     
     # Save training data
-    train_emb_path = os.path.join(task_dir, "train_embeddings.pt")
-    train_labels_path = os.path.join(task_dir, "train_labels.pt")
-    train_seqs_path = os.path.join(task_dir, "train_sequences.pt")
-    torch.save(all_train_embeddings, train_emb_path)
-    torch.save(all_train_labels, train_labels_path)
-    torch.save(all_train_sequences, train_seqs_path)
-    print(f"✅ Saved combined training data: {len(all_train_embeddings)} samples")
+    if all_train_embeddings_tensor is not None:
+        train_emb_path = os.path.join(task_dir, "train_embeddings.pt")
+        train_metadata_path = os.path.join(task_dir, "train_embeddings_metadata.json")
+        train_labels_path = os.path.join(task_dir, "train_labels.pt")
+        train_seqs_path = os.path.join(task_dir, "train_sequences.pt")
+        torch.save(all_train_embeddings_tensor, train_emb_path)
+        EmbeddingGeneratorInference.save_metadata(all_train_metadata_list, train_metadata_path)
+        torch.save(all_train_labels, train_labels_path)
+        torch.save(all_train_sequences, train_seqs_path)
+        print(f"✅ Saved combined training data: {train_num_seqs} samples")
 
     # Save validation data
-    valid_emb_path = os.path.join(task_dir, "valid_embeddings.pt")
-    valid_labels_path = os.path.join(task_dir, "valid_labels.pt")
-    valid_seqs_path = os.path.join(task_dir, "valid_sequences.pt")
-    torch.save(all_valid_embeddings, valid_emb_path)
-    torch.save(all_valid_labels, valid_labels_path)
-    torch.save(all_valid_sequences, valid_seqs_path)
-    print(f"✅ Saved combined validation data: {len(all_valid_embeddings)} samples")
+    if all_valid_embeddings_tensor is not None:
+        valid_emb_path = os.path.join(task_dir, "valid_embeddings.pt")
+        valid_metadata_path = os.path.join(task_dir, "valid_embeddings_metadata.json")
+        valid_labels_path = os.path.join(task_dir, "valid_labels.pt")
+        valid_seqs_path = os.path.join(task_dir, "valid_sequences.pt")
+        torch.save(all_valid_embeddings_tensor, valid_emb_path)
+        EmbeddingGeneratorInference.save_metadata(all_valid_metadata_list, valid_metadata_path)
+        torch.save(all_valid_labels, valid_labels_path)
+        torch.save(all_valid_sequences, valid_seqs_path)
+        print(f"✅ Saved combined validation data: {valid_num_seqs} samples")
 
     # Save test data
-    test_emb_path = os.path.join(task_dir, "test_embeddings.pt")
-    test_labels_path = os.path.join(task_dir, "test_labels.pt")
-    test_seqs_path = os.path.join(task_dir, "test_sequences.pt")
-    torch.save(all_test_embeddings, test_emb_path)
-    torch.save(all_test_labels, test_labels_path)
-    torch.save(all_test_sequences, test_seqs_path)
-    print(f"✅ Saved combined test data: {len(all_test_embeddings)} samples")
+    if all_test_embeddings_tensor is not None:
+        test_emb_path = os.path.join(task_dir, "test_embeddings.pt")
+        test_metadata_path = os.path.join(task_dir, "test_embeddings_metadata.json")
+        test_labels_path = os.path.join(task_dir, "test_labels.pt")
+        test_seqs_path = os.path.join(task_dir, "test_sequences.pt")
+        torch.save(all_test_embeddings_tensor, test_emb_path)
+        EmbeddingGeneratorInference.save_metadata(all_test_metadata_list, test_metadata_path)
+        torch.save(all_test_labels, test_labels_path)
+        torch.save(all_test_sequences, test_seqs_path)
+        print(f"✅ Saved combined test data: {test_num_seqs} samples")
     
     print("\n" + "="*70)
     print("🎉 Embedding generation completed for all sequence columns!")
-    print(f"   Total training samples: {len(all_train_embeddings)}")
-    print(f"   Total validation samples: {len(all_valid_embeddings)}")
-    print(f"   Total test samples: {len(all_test_embeddings)}")
+    print(f"   Total training samples: {train_num_seqs}")
+    print(f"   Total validation samples: {valid_num_seqs}")
+    print(f"   Total test samples: {test_num_seqs}")
     print("="*70)
 
 

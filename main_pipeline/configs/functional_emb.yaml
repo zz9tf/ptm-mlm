@@ -1,0 +1,24 @@
+# Base configuration file - contains all default settings
+
+# Experiment name - used for organizing output directories
+exp_name: ptm-mamba
+
+# Random seed
+seed: 42
+
+# Reporting/logging backend (e.g., ["wandb"] for Weights & Biases)
+report_to: []
+
+preprocess:
+  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/processing_data/functional_role/ptm_sites_with_functional_role.csv"
+
+training:
+  esm_model: "esm2_650m"  # ESM model name: "esm2_650m", "esm2_15b", "esm3_7b", "esmc_300m", "esmc_600m"
+  repr_layer: 32  # Representation layer index (null = use model default/last layer). Only used for embedding dimension detection.
+  max_sequence_length: 512  # Maximum sequence length for embedding generation (sequences longer than this will be split into windows)
+
+# Dataset configuration
+dataset:
+  # Note: sequence_column_name is only needed for generate_embeddings.py, not for training
+  # Training uses pre-generated memmap files from dataset_dir
+  dataset_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/embeddings/esm2_650m/30"

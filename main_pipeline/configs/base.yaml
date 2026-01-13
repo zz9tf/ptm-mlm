@@ -10,14 +10,15 @@ seed: 42
 report_to: []
 
 preprocess:
-  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/processing_data/functional_role/ptm_sites_with_functional_role.csv"
+  # dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/processing_data/functional_role/ptm_sites_with_functional_role.csv"
+  # dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/mamba.csv"
+  dataset_location: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/combined.csv"
 
 # Dataset configuration
 dataset:
-  # CSV file path for embedding generation
-  # ESM input uses --original_sequence_column when --use_original_sequence is set
-  sequence_column_name: "ptm_seq"
-  dataset_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/embeddings"
+  # Note: sequence_column_name is only needed for generate_embeddings.py, not for training
+  # Training uses pre-generated memmap files from dataset_dir
+  dataset_dir: "/home/zz/zheng/ptm-mlm/main_pipeline/datasets/embeddings/esmc_600/30"
   preload_all: false
   use_functional_role: false  # Whether to use functional role data (requires functional_role.dat and functional_role_position.dat files)
 

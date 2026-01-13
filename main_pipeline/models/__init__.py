@@ -7,19 +7,19 @@ Simple and direct structure:
 - Model: Main model (PTMModel)
 """
 
-from models.block import (
+from .block import (
     LoRABlock,
     build_block,
     BLOCK_REGISTRY,
 )
-from models.head import (
+from .head import (
     OriginalHead,
     PTMHead,
     FunctionalRoleHead,
     build_head,
     HEAD_REGISTRY,
 )
-from models.model import PTMModel
+from .model import PTMModel
 
 __all__ = [
     # Blocks

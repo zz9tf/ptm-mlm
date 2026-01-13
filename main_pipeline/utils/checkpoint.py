@@ -1,6 +1,6 @@
 import torch
 from types import SimpleNamespace
-from models.mamba.lm import MambaLMHeadModel
+from ..models.mamba.lm import MambaLMHeadModel
 from accelerate import Accelerator
 import os
 
